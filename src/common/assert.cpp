@@ -8,6 +8,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/logging/events.h"
+#include "common/recover_point.h"
 #include "common/thread.h"
 #include "core/signals.h"
 #include "emulator.h"
@@ -59,6 +60,10 @@ static void ReportAssertionCrash() {
 }
 
 void assert_fail_impl() {
+    // Draw preparation helpers work on guessed state: their assertions abandon the guess
+    if (Common::Recover::Active()) {
+        Common::Recover::Jump();
+    }
     ReportAssertionCrash();
     Core::Signals::Instance()->RemoveHandlers();
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();

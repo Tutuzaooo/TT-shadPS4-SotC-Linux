@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <optional>
+#include <utility>
 #include <array>
 #include <memory>
 #include <vector>
@@ -43,11 +45,19 @@ public:
     [[nodiscard]] StagingBufferRef Request(u64 size, VideoCore::MemoryType type, u64 alignment = 0,
                                            bool deferred = false, bool unsynchronized = false);
 
+    /// Like Request for a synchronized ring allocation, but the ring of this type does not grow
+    /// past max_ring_bytes: returns nullopt when no block has room right now and it is that large
+    [[nodiscard]] std::optional<StagingBufferRef> TryRequest(u64 size, VideoCore::MemoryType type,
+                                                             u64 alignment, u64 max_ring_bytes);
+
     /// Releases a deferred allocation. It becomes reusable once the current tick completes.
     void FreeDeferred(const StagingBufferRef& ref);
 
     /// Releases idle memory.
     void TickFrame();
+
+    /// Bytes held for a memory type: {ring blocks, dedicated buffers}. Same thread as TickFrame
+    [[nodiscard]] std::pair<u64, u64> HeldBytes(VideoCore::MemoryType type) const;
 
 private:
     struct Block {

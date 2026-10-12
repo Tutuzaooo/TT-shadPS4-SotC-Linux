@@ -3,12 +3,15 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <string>
 #include <string_view>
 
+#include "common/arch.h"
 #include "common/types.h"
+#include "common/uint128.h"
 
 // SHADPS4_PERF_STATS gathers frame costs with relaxed atomic counters and reports them every 10 seconds
 // Disabled calls take one predictable branch. Timers nest, so draw time includes walker, fault and readback
@@ -36,6 +39,12 @@ enum class Id : u32 {
     Readbacks,
     ReadbackNs,
     ReadbackBytes,
+    // readback_hot_regions: recent readback windows downloaded along with a
+    // readback that drained the GPU, and the command processor time spent
+    // recording and writing them
+    ReadbackHotRegions,
+    ReadbackHotBytes,
+    ReadbackHotNs,
     ImageDownloads,
     // Vulkan drains, timeline waits, submits and GPU time from rasterizer command buffer timestamps
     VkFinish,
@@ -175,15 +184,90 @@ enum class Id : u32 {
     // Count times the command processor wakes a sleeping recording thread after making another
     // command batch available
     RecorderWakes,
+    // Texture bindings that are the draw's own read-only depth target
+    // (depth_target_sampled_layout shares one layout between the two uses)
+    DepthTargetSampled,
+    // gcn_unordered_dispatches: barrier points of dispatches GCN runs unordered with
+    // the previous dispatch of their ring, and those whose memory barrier was left out
+    GcnUnorderedPoints,
+    GcnUnorderedSkips,
+    // access_bitmap_tracking: buffer access checks whose bitmap matched, and those of
+    // them the exact ranges did not confirm; with SHADPS4_ACCESS_BITMAP_VERIFY, checks
+    // whose answer differs from the interval lists
+    AccessBitmapHits,
+    AccessBitmapFalseHits,
+    AccessBitmapMismatches,
+    // range_fast_paths: written bindings, sync batch adds and residency checks answered
+    // by the shortcuts; with SHADPS4_RANGE_FAST_VERIFY, shortcuts whose answer differs
+    // from the interval structures
+    RangeFastWrittenHits,
+    RangeFastSyncHits,
+    RangeFastResidentHits,
+    RangeFastMismatches,
+    // Render and depth target updates that skipped the texture cache lock
+    // (TextureCache::UpdateTarget); with SHADPS4_TARGET_FAST_VERIFY, skips the
+    // locked check found wrong
+    TargetUpdatesSkipped,
+    TargetSkipMismatches,
+    // unbounded_vsharp_cap_mb: read-only V# with num_records 0xffffffff cut at the
+    // cap, and the bytes cut off
+    UnboundedClamps,
+    UnboundedClampBytes,
     Count,
 };
 
 bool Enabled();
 
 namespace Detail {
-std::atomic<u64>& Slot(Id id);
-extern std::atomic<bool> ab_toggle_on;
+/// Give each shared counter its own cache line to avoid contention between threads
+struct alignas(64) PaddedSlot {
+    std::atomic<u64> value{};
+};
+extern std::array<PaddedSlot, static_cast<size_t>(Id::Count)> slots;
+
+inline std::atomic<u64>& Slot(Id id) {
+    return slots[static_cast<size_t>(id)].value;
 }
+
+/// The command processor thread (MarkGpuThread)
+extern thread_local bool cp_thread;
+/// Use ordinary adds for command processor counters because they have one writer
+/// Report the difference since the previous TakeReport
+extern std::array<std::atomic<u64>, static_cast<size_t>(Id::Count)> cp_slots;
+
+inline void AddTo(Id id, u64 value) {
+    if (cp_thread) {
+        auto& slot = cp_slots[static_cast<size_t>(id)];
+        slot.store(slot.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
+    } else {
+        Slot(id).fetch_add(value, std::memory_order_relaxed);
+    }
+}
+
+/// Use the cheaper TSC clock on x86-64
+/// Measure nanoseconds per tick at startup only when SHADPS4_PERF_STATS is enabled
+extern u64 ns_per_tick;
+
+inline u64 Ticks() {
+#ifdef ARCH_X86_64
+    return __builtin_ia32_rdtsc();
+#else
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+#endif
+}
+
+inline u64 TicksToNs(u64 ticks) {
+#ifdef ARCH_X86_64
+    return MultiplyHigh(ticks, ns_per_tick);
+#else
+    return ticks;
+#endif
+}
+
+extern std::atomic<bool> ab_toggle_on;
+} // namespace Detail
 
 /// Returns the active side of the in-run A/B toggle
 inline bool AbToggleActive() {
@@ -210,7 +294,7 @@ void OnReportEmitted(double seconds_since_start);
 
 inline void Add(Id id, u64 value = 1) {
     if (Enabled()) {
-        Detail::Slot(id).fetch_add(value, std::memory_order_relaxed);
+        Detail::AddTo(id, value);
     }
 }
 
@@ -230,16 +314,14 @@ class ScopedTimer {
 public:
     ScopedTimer(Id count, Id ns) : count_id{count}, ns_id{ns}, active{Enabled()} {
         if (active) {
-            start = std::chrono::steady_clock::now();
+            start = Detail::Ticks();
         }
     }
     ~ScopedTimer() {
         if (active) {
-            const auto elapsed = std::chrono::steady_clock::now() - start;
-            Detail::Slot(count_id).fetch_add(1, std::memory_order_relaxed);
-            Detail::Slot(ns_id).fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
-                std::memory_order_relaxed);
+            const u64 elapsed = Detail::Ticks() - start;
+            Detail::AddTo(count_id, 1);
+            Detail::AddTo(ns_id, Detail::TicksToNs(elapsed));
         }
     }
     ScopedTimer(const ScopedTimer&) = delete;
@@ -249,7 +331,7 @@ private:
     Id count_id;
     Id ns_id;
     bool active;
-    std::chrono::steady_clock::time_point start;
+    u64 start{};
 };
 
 /// Adds the elapsed nanoseconds to `ns` when it goes out of scope (no count)
@@ -257,15 +339,12 @@ class ScopedNs {
 public:
     explicit ScopedNs(Id ns) : ns_id{ns}, active{Enabled()} {
         if (active) {
-            start = std::chrono::steady_clock::now();
+            start = Detail::Ticks();
         }
     }
     ~ScopedNs() {
         if (active) {
-            Detail::Slot(ns_id).fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                              std::chrono::steady_clock::now() - start)
-                                              .count(),
-                                          std::memory_order_relaxed);
+            Detail::AddTo(ns_id, Detail::TicksToNs(Detail::Ticks() - start));
         }
     }
     ScopedNs(const ScopedNs&) = delete;
@@ -274,7 +353,7 @@ public:
 private:
     Id ns_id;
     bool active;
-    std::chrono::steady_clock::time_point start;
+    u64 start{};
 };
 
 /// Marks the calling thread as the GPU command processor thread

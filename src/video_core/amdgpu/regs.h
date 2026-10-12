@@ -3,6 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <bitset>
+#include <cstring>
+#include <vector>
+
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -187,6 +192,65 @@ union Regs {
     }
 
     void SetDefaults();
+};
+
+/// Draw pipe (vk_draw_pipe.h): the register blocks written since the last draw handed to the
+/// recording thread, which keeps its own copy of the register file and applies only these.
+struct RegDirty {
+    static constexpr u32 BlockWords = 32;
+    static constexpr u32 NumBlocks = Regs::NumRegs / BlockWords;
+    std::bitset<NumBlocks> blocks;
+    bool reset = false; ///< SetDefaults ran: defaults first, then the marked blocks
+
+    void Mark(u32 word, u32 count) {
+        if (count == 0 || word >= Regs::NumRegs) {
+            return;
+        }
+        const u32 last = std::min(word + count, Regs::NumRegs) - 1;
+        for (u32 block = word / BlockWords; block <= last / BlockWords; ++block) {
+            blocks.set(block);
+        }
+    }
+    template <typename T>
+    void MarkField(const Regs& regs, const T& field) {
+        const auto offset = reinterpret_cast<const u8*>(&field) -
+                            reinterpret_cast<const u8*>(regs.reg_array.data());
+        Mark(u32(offset / sizeof(u32)), u32((sizeof(T) + sizeof(u32) - 1) / sizeof(u32)));
+    }
+    void Clear() {
+        blocks.reset();
+        reset = false;
+    }
+};
+
+/// The register blocks a stretch of commands wrote, with their values at its end (draw
+/// preparation, vk_draw_prep.h: replays the command stream ahead of the GPU thread)
+struct RegDelta {
+    bool reset = false;
+    std::vector<u16> blocks;
+    std::vector<u32> words;
+
+    void Capture(const Regs& regs, const RegDirty& dirty) {
+        reset = dirty.reset;
+        blocks.clear();
+        words.clear();
+        for (size_t block = dirty.blocks._Find_first(); block < dirty.blocks.size();
+             block = dirty.blocks._Find_next(block)) {
+            blocks.push_back(static_cast<u16>(block));
+            const u32* src = regs.reg_array.data() + block * RegDirty::BlockWords;
+            words.insert(words.end(), src, src + RegDirty::BlockWords);
+        }
+    }
+    void Apply(Regs& regs) const {
+        if (reset) {
+            regs.SetDefaults();
+        }
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            std::memcpy(regs.reg_array.data() + blocks[i] * RegDirty::BlockWords,
+                        words.data() + i * RegDirty::BlockWords,
+                        RegDirty::BlockWords * sizeof(u32));
+        }
+    }
 };
 
 #undef DO_CONCAT2

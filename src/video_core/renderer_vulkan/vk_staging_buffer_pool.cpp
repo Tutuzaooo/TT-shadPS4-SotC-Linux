@@ -44,6 +44,38 @@ StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 align
     return RequestFromRing(ring, size, alignment, type, unsynchronized);
 }
 
+std::optional<StagingBufferRef> StagingBufferPool::TryRequest(u64 size, MemoryType type,
+                                                              u64 alignment, u64 max_ring_bytes) {
+    Ring& ring = rings[u32(type)];
+    if (size > BLOCK_SIZE || max_ring_bytes == 0 ||
+        ring.blocks.size() * BLOCK_SIZE < max_ring_bytes) {
+        return Request(size, type, alignment);
+    }
+    // The ring is at its limit: only a block the GPU is done with can serve the request
+    for (size_t i = 0; i < ring.blocks.size(); ++i) {
+        const size_t index = (ring.current + i) % ring.blocks.size();
+        Block& block = ring.blocks[index];
+        const auto offset = block.buffer->Reserve(size, alignment, false);
+        if (!offset) {
+            continue;
+        }
+        ring.current = index;
+        block.last_used_frame = frame;
+        auto& buffer = *block.buffer;
+        StagingBufferRef ref{
+            .buffer = &buffer,
+            .offset = *offset,
+            .size = size,
+            .type = type,
+        };
+        if (!buffer.mapped_data.empty()) {
+            ref.mapped = buffer.mapped_data.data() + *offset;
+        }
+        return ref;
+    }
+    return std::nullopt;
+}
+
 StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 alignment,
                                                     MemoryType type, bool unsynchronized) {
     Block* best{};
@@ -141,6 +173,18 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
     it->held = false;
     it->tick = scheduler.CurrentTick();
     it->last_used_frame = frame;
+}
+
+std::pair<u64, u64> StagingBufferPool::HeldBytes(MemoryType type) const {
+    u64 ring_bytes = 0;
+    u64 large_bytes = 0;
+    for (const Block& block : rings[u32(type)].blocks) {
+        ring_bytes += block.buffer->SizeBytes();
+    }
+    for (const LargeBuffer& entry : large_caches[u32(type)]) {
+        large_bytes += entry.buffer->SizeBytes();
+    }
+    return {ring_bytes, large_bytes};
 }
 
 void StagingBufferPool::TickFrame() {

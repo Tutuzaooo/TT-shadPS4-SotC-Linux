@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdlib>
 #include <mutex>
+#include <ratio>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -12,6 +13,7 @@
 #include <fmt/format.h>
 
 #include "common/perf_stats.h"
+#include "common/rdtsc.h"
 
 namespace Common::PerfStats {
 
@@ -40,6 +42,9 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::Readbacks, "readbacks", Unit::Count},
     {Id::ReadbackNs, "readback_ms", Unit::Ms},
     {Id::ReadbackBytes, "readback_kb", Unit::Kb},
+    {Id::ReadbackHotRegions, "rb_hot", Unit::Count},
+    {Id::ReadbackHotBytes, "rb_hot_kb", Unit::Kb},
+    {Id::ReadbackHotNs, "rb_hot_ms", Unit::Ms},
     {Id::ImageDownloads, "image_downloads", Unit::Count},
     {Id::VkFinish, "vk_finish", Unit::Count},
     {Id::VkFinishNs, "vk_finish_ms", Unit::Ms},
@@ -138,6 +143,20 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::RecorderSubmitWaits, "rec_submit_waits", Unit::Count},
     {Id::RecorderSubmitWaitNs, "rec_submit_wait_ms", Unit::Ms},
     {Id::RecorderWakes, "rec_wakes", Unit::Count},
+    {Id::DepthTargetSampled, "depth_tgt_sampled", Unit::Count},
+    {Id::GcnUnorderedPoints, "gcn_points", Unit::Count},
+    {Id::GcnUnorderedSkips, "gcn_skips", Unit::Count},
+    {Id::AccessBitmapHits, "access_bm_hits", Unit::Count},
+    {Id::AccessBitmapFalseHits, "access_bm_false_hits", Unit::Count},
+    {Id::AccessBitmapMismatches, "access_bm_mismatches", Unit::Count},
+    {Id::RangeFastWrittenHits, "rf_written_hits", Unit::Count},
+    {Id::RangeFastSyncHits, "rf_sync_hits", Unit::Count},
+    {Id::RangeFastResidentHits, "rf_resident_hits", Unit::Count},
+    {Id::RangeFastMismatches, "rf_mismatches", Unit::Count},
+    {Id::TargetUpdatesSkipped, "target_skips", Unit::Count},
+    {Id::TargetSkipMismatches, "target_skip_mismatches", Unit::Count},
+    {Id::UnboundedClamps, "unbounded_clamps", Unit::Count},
+    {Id::UnboundedClampBytes, "unbounded_clamp_kb", Unit::Kb},
 }};
 
 constexpr bool FieldsMatchIds() {
@@ -149,9 +168,6 @@ constexpr bool FieldsMatchIds() {
     return true;
 }
 static_assert(FieldsMatchIds(), "Fields must list every Id in enum order");
-
-std::array<std::atomic<u64>, static_cast<size_t>(Id::Count)> slots{};
-thread_local bool is_gpu_thread = false;
 
 // Fault regions: only touched on handled faults, which already cost microseconds or more
 constexpr u32 RegionBits = 20;
@@ -169,9 +185,13 @@ bool Enabled() {
     return enabled;
 }
 
-std::atomic<u64>& Detail::Slot(Id id) {
-    return slots[static_cast<size_t>(id)];
-}
+std::array<Detail::PaddedSlot, static_cast<size_t>(Id::Count)> Detail::slots{};
+thread_local bool Detail::cp_thread = false;
+std::array<std::atomic<u64>, static_cast<size_t>(Id::Count)> Detail::cp_slots{};
+
+// 100 ms at startup, only with SHADPS4_PERF_STATS
+u64 Detail::ns_per_tick =
+    Enabled() ? GetFixedPoint64Factor(std::nano::den, EstimateRDTSCFrequency()) : 0;
 
 namespace {
 // Seconds of reports before SHADPS4_AB_TOGGLE starts flipping, or a negative value without it
@@ -230,18 +250,18 @@ void OnReportEmitted(double seconds_since_start) {
 }
 
 void MarkGpuThread() {
-    is_gpu_thread = true;
+    Detail::cp_thread = true;
 }
 
 bool IsGpuThread() {
-    return is_gpu_thread;
+    return Detail::cp_thread;
 }
 
 void RecordFaultRegion(u64 address, bool is_write) {
     if (!Enabled()) {
         return;
     }
-    const RegionKind kind = is_gpu_thread ? GpuThread : is_write ? GuestWrite : GuestRead;
+    const RegionKind kind = Detail::cp_thread ? GpuThread : is_write ? GuestWrite : GuestRead;
     std::scoped_lock lk{region_mutex};
     ++region_counts[kind][address >> RegionBits];
     if (kind == GuestWrite && guest_write_pages.insert(address >> PageBits).second) {
@@ -291,10 +311,17 @@ std::string TakeReport() {
         std::scoped_lock lk{region_mutex};
         guest_write_pages.clear();
     }
+    // What the command processor's counters held at the previous report
+    static std::array<u64, static_cast<size_t>(Id::Count)> cp_reported{};
+    static std::mutex cp_reported_mutex;
+    std::scoped_lock cp_lk{cp_reported_mutex};
     std::string report;
     for (const auto& field : Fields) {
-        const u64 value =
-            slots[static_cast<size_t>(field.id)].exchange(0, std::memory_order_relaxed);
+        const size_t index = static_cast<size_t>(field.id);
+        const u64 cp_total = Detail::cp_slots[index].load(std::memory_order_relaxed);
+        const u64 value = Detail::Slot(field.id).exchange(0, std::memory_order_relaxed) +
+                          cp_total - cp_reported[index];
+        cp_reported[index] = cp_total;
         if (!report.empty()) {
             report += ' ';
         }

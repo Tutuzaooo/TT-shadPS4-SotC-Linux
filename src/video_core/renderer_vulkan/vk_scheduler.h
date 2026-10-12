@@ -421,6 +421,10 @@ public:
     /// writes to the command stream
     void ClaimRecorder();
 
+    /// Draw pipe: the draw recording thread records on this scheduler in turns with the command
+    /// processor thread (CommandRecorder::AllowSecondProducer)
+    void AllowSecondRecorder(u32 tid);
+
     [[nodiscard]] bool IsRecorded() const noexcept {
         return recording;
     }

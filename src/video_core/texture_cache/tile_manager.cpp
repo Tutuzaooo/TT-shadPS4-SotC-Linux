@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/perf_stats.h"
 #include "core/emulator_settings.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
@@ -245,9 +246,26 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         // then reads VRAM. Requested after the unsynchronized output so the two cannot share bytes, except
         // when the ring was full: the output then got offset 0 of a block without reserving it, and this
         // request may reserve the same bytes. The detile then reads the host copy as before
-        local = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal, 256);
-        via_vram = local.buffer != staging.buffer || local.offset >= staging.offset + info.guest_size ||
-                   staging.offset >= local.offset + info.guest_size;
+        // These copies made the video memory staging ring grow with every burst of uploads (1 GiB
+        // in the SotC opening area, never given back: the ring keeps cycling through its blocks).
+        // PINK_STAGING_VRAM_MB=<n> limits the ring (default 256); with the ring full and busy the
+        // detile reads the host copy as before. 0 removes the limit.
+        static const u64 max_ring_bytes = [] {
+            const char* v = std::getenv("PINK_STAGING_VRAM_MB");
+            const u64 mb = v ? std::strtoull(v, nullptr, 10) : 256;
+            LOG_WARNING(Render_Vulkan, "Video memory staging ring limit: {} MiB", mb);
+            return mb << 20;
+        }();
+        const auto request = runtime.GetStagingPool().TryRequest(
+            info.guest_size, MemoryType::DeviceLocal, 256, max_ring_bytes);
+        if (request) {
+            local = *request;
+            via_vram = local.buffer != staging.buffer ||
+                       local.offset >= staging.offset + info.guest_size ||
+                       staging.offset >= local.offset + info.guest_size;
+        } else {
+            via_vram = false;
+        }
     }
     if (via_vram) {
         const vk::BufferCopy copy{

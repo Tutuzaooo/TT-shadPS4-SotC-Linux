@@ -21,7 +21,9 @@ namespace Serialization {
 // plus one_vgprs). ShaderMetaVersion 9: with srt_walker_clean_reads the SRT walker guest loads test the
 // clean-page bitmap first (the key is in the codegen settings key). ShaderBinaryVersion 7: subgroup built-in
 // inputs are Flat only in fragment shaders (vertex shaders had an invalid Flat)
-static constexpr u32 ShaderBinaryVersion = 7u;
+// ShaderBinaryVersion 8: upstream ISA fixes (#5030, #5031, #5141, #5185, #5186,
+// #5194, #5199, #5200, #5202)
+static constexpr u32 ShaderBinaryVersion = 8u;
 static constexpr u32 ShaderMetaVersion = 9u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
@@ -32,6 +34,9 @@ namespace {
 /// Emulator settings that change the generated SPIR-V. The disk cache is keyed only by the guest shader hash,
 /// so a shader compiled with other values must be recompiled, not loaded
 constexpr u32 LdsBarriersLargeGroupsBit = 46;
+constexpr u32 RelativeInstanceIdBit = 47;
+constexpr u32 GcnNanSemanticsBit = 48;
+constexpr u32 LegacyMadSemanticsBit = 49;
 
 u64 CodegenSettingsKey() {
     return u64{EmulatorSettings.GetComputeLoopCap()} |
@@ -43,7 +48,10 @@ u64 CodegenSettingsKey() {
            (u64{EmulatorSettings.IsInlineFetchShader()} << 43) |
            (u64{EmulatorSettings.IsSrtWalkerCleanReads()} << 44) | // SRT walker code
            (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45) |
-           (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit);
+           (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit) |
+           (u64{EmulatorSettings.IsRelativeInstanceId()} << RelativeInstanceIdBit) |
+           (u64{EmulatorSettings.IsGcnNanSemantics()} << GcnNanSemanticsBit) |
+           (u64{EmulatorSettings.IsLegacyMadSemantics()} << LegacyMadSemanticsBit);
 }
 
 /// lds_barriers_large_groups only affects compute shaders that use LDS in workgroups larger than
@@ -59,6 +67,21 @@ bool LdsBarriersLargeGroupsAffects(const Shader::RuntimeInfo& runtime_info) {
     return cs.shared_memory_size != 0 &&
            cs.workgroup_size[0] * cs.workgroup_size[1] * cs.workgroup_size[2] > 64;
 }
+
+/// relative_instance_id only affects vertex shaders that receive instance ID VGPRs
+/// (Translator::EmitPrologue), so toggling it keeps the other cached shaders
+bool RelativeInstanceIdAffects(const Shader::RuntimeInfo& runtime_info) {
+    return runtime_info.sw_stage == Shader::SwStage::Vertex &&
+           runtime_info.props.num_input_vgprs > 0;
+}
+
+/// Permutations preloaded into a program already in the cache, and how many of them
+/// carried flattened user data other than the program's
+struct PreloadUdStats {
+    u32 added_permutations;
+    u32 differing;
+    u32 size_mismatch;
+} preload_ud_stats{};
 } // namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
@@ -161,7 +184,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(codegen_key);
     const u64 key_diff = codegen_key ^ CodegenSettingsKey();
     constexpr u64 lds_barriers_mask = u64{1} << LdsBarriersLargeGroupsBit;
-    if ((key_diff & ~lds_barriers_mask) != 0) {
+    constexpr u64 relative_instance_mask = u64{1} << RelativeInstanceIdBit;
+    if ((key_diff & ~(lds_barriers_mask | relative_instance_mask)) != 0) {
         return false;
     }
 
@@ -172,6 +196,10 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     spec.Deserialize(ar);
     if ((key_diff & lds_barriers_mask) != 0 &&
         LdsBarriersLargeGroupsAffects(spec.runtime_info)) {
+        return false;
+    }
+    if ((key_diff & relative_instance_mask) != 0 &&
+        RelativeInstanceIdAffects(spec.runtime_info)) {
         return false;
     }
     if (!info.Deserialize(ar)) {
@@ -356,6 +384,18 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             module = it_pgm.value()->modules[idx].module;
         } else {
             module = CompileSPV(spv, instance.GetDevice());
+            // Build the pipeline with this record's flattened user data
+            // The first record may have different descriptor counts
+            // Keep a different buffer size unchanged because it uses another SRT layout
+            auto& program_ud = it_pgm.value()->info.flattened_ud_buf;
+            auto& record_ud = program->info.flattened_ud_buf;
+            ++preload_ud_stats.added_permutations;
+            if (record_ud.size() != program_ud.size()) {
+                ++preload_ud_stats.size_mismatch;
+            } else if (record_ud != program_ud) {
+                ++preload_ud_stats.differing;
+                program_ud = std::move(record_ud);
+            }
         }
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
@@ -437,6 +477,11 @@ void PipelineCache::WarmUp() {
         });
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    LOG_INFO(Render,
+             "Preloaded permutations of known programs: {}, {} with their own flattened user data, "
+             "{} with another size (kept the program's)",
+             preload_ud_stats.added_permutations, preload_ud_stats.differing,
+             preload_ud_stats.size_mismatch);
     LOG_INFO(Render, "SRT walker code after preload: {} KiB, {} KiB shared with identical walkers",
              Shader::GetSrtCodeUsage() >> 10, Shader::GetSrtCodeShared() >> 10);
     if (num_total_pipelines > num_pipelines) {

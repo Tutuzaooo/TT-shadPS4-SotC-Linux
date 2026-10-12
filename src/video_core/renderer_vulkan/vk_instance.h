@@ -276,6 +276,12 @@ public:
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
+    /// Returns true when VK_KHR_external_memory_win32 and VK_KHR_external_semaphore_win32 are
+    /// enabled, so images and fences can be shared with D3D12
+    bool IsD3D12InteropSupported() const {
+        return d3d12_interop;
+    }
+
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
@@ -468,6 +474,10 @@ public:
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
 
+    /// Returns what the driver says this process may use right now (the heap sizes less what
+    /// other programs hold), optionally with the amount in use.
+    [[nodiscard]] u64 GetDeviceMemoryBudget(u64* usage = nullptr) const;
+
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
         return total_memory_budget;
@@ -565,6 +575,7 @@ private:
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     bool device_fault{};
+    bool d3d12_interop{};
     bool nv_diagnostic_checkpoints{};
     bool nv_diagnostics_config{};
     u64 total_memory_budget{};

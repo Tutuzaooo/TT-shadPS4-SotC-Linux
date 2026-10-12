@@ -122,6 +122,13 @@ public:
     /// stops the recorder
     void ClaimProducer();
 
+    /// Draw pipe (vk_draw_pipe.h): the draw recording thread produces in turns with the command
+    /// processor thread. The hand-over is ordered by the pipe (one waits for the other to be
+    /// idle), so the stream still has one producer at a time
+    void AllowSecondProducer(u32 tid) noexcept {
+        second_producer_tid = tid;
+    }
+
     /// Connect a fake command buffer handle to the real buffer allocated by the consumer before
     /// queued commands use it
     void Bind(VkCommandBuffer fake, VkCommandBuffer real) noexcept;
@@ -192,6 +199,7 @@ private:
     u32 unpublished{};
     u32 producer_tid{};
     u32 producer_switches{};
+    u32 second_producer_tid{};
 
     // State written by the consumer while it runs queued commands and advances through the stream
     // chunks

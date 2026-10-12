@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -59,6 +61,10 @@
 #endif
 #include <core/file_format/npbind.h>
 
+#ifdef PINK_PGO_GENERATE
+extern "C" int __llvm_profile_write_file(void);
+#endif
+
 Frontend::WindowSDL* g_window = nullptr;
 
 namespace Libraries::Kernel {
@@ -81,6 +87,16 @@ Emulator::Emulator() {
     WSAStartup(versionWanted, &wsaData);
 #endif
     std::at_quick_exit([]() { Common::Singleton<Core::Emulator>::Instance()->Shutdown(); });
+#ifdef PINK_PGO_GENERATE
+    // Profile-collecting build (build-pgo.sh): the emulator leaves through quick_exit or a crash,
+    // which skip the profile runtime's own writer, so the counters are written every 30 s instead
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds{30});
+            __llvm_profile_write_file();
+        }
+    }).detach();
+#endif
 }
 
 Emulator::~Emulator() {}

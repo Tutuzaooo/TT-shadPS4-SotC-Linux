@@ -213,13 +213,13 @@ execute_process(
 
 # Set Version
 set(EMULATOR_VERSION_MAJOR "0")
-set(EMULATOR_VERSION_MINOR "3")
+set(EMULATOR_VERSION_MINOR "4")
 set(EMULATOR_VERSION_PATCH "0")
 
 set_source_files_properties(src/dist/shadps4.rc PROPERTIES COMPILE_DEFINITIONS "EMULATOR_VERSION_MAJOR=${EMULATOR_VERSION_MAJOR};EMULATOR_VERSION_MINOR=${EMULATOR_VERSION_MINOR};EMULATOR_VERSION_PATCH=${EMULATOR_VERSION_PATCH}")
 
 set(APP_VERSION_NUM "${EMULATOR_VERSION_MAJOR}.${EMULATOR_VERSION_MINOR}.${EMULATOR_VERSION_PATCH}")
-set(APP_VERSION "${APP_VERSION_NUM} WIP")
+set(APP_VERSION "${APP_VERSION_NUM}")
 set(APP_IS_RELEASE false)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/common/scm_rev.cpp.in" "${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp" @ONLY)
 
@@ -814,6 +814,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/path_util.h
            src/common/object_pool.h
            src/common/polyfill_thread.h
+           src/common/recover_point.h
            src/common/rdtsc.cpp
            src/common/rdtsc.h
            src/common/recursive_lock.cpp
@@ -1131,6 +1132,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/region_manager.h
                src/video_core/renderer_vulkan/liverpool_to_vk.cpp
                src/video_core/renderer_vulkan/liverpool_to_vk.h
+               src/video_core/renderer_vulkan/vk_access_bitmap.cpp
+               src/video_core/renderer_vulkan/vk_access_bitmap.h
                src/video_core/renderer_vulkan/vk_bind_cache.h
                src/video_core/renderer_vulkan/vk_common.cpp
                src/video_core/renderer_vulkan/vk_common.h
@@ -1139,6 +1142,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
                src/video_core/renderer_vulkan/vk_draw_trace.h
+               src/video_core/renderer_vulkan/vk_draw_prep.cpp
+               src/video_core/renderer_vulkan/vk_draw_prep.h
                src/video_core/renderer_vulkan/vk_gpu_checkpoints.h
                src/video_core/renderer_vulkan/vk_instance.cpp
                src/video_core/renderer_vulkan/vk_instance.h
@@ -1173,6 +1178,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
                src/video_core/renderer_vulkan/vk_swapchain.cpp
                src/video_core/renderer_vulkan/vk_swapchain.h
+               src/video_core/renderer_vulkan/host_passes/dlssnr_pass.cpp
+               src/video_core/renderer_vulkan/host_passes/dlssnr_pass.h
                src/video_core/renderer_vulkan/host_passes/fsr_pass.cpp
                src/video_core/renderer_vulkan/host_passes/fsr_pass.h
                src/video_core/renderer_vulkan/host_passes/pp_pass.cpp
@@ -1422,6 +1429,20 @@ endif()
 
 if (WIN32)
     target_sources(shadps4 PRIVATE src/dist/shadps4.rc)
+
+    # Load the DLSS Neural Rendering bridge from the folder of shadps4.exe
+    # Include "nvngx.dll" in its name because the model checks the caller's module path
+    add_library(dlssnr_bridge SHARED
+        src/video_core/renderer_vulkan/host_passes/dlssnr_bridge/dlssnr_bridge.cpp
+        src/video_core/renderer_vulkan/host_passes/dlssnr_bridge/dlssnr_bridge.h
+    )
+    set_target_properties(dlssnr_bridge PROPERTIES
+        OUTPUT_NAME "nvngx.dll_dlssnr"
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    target_link_libraries(dlssnr_bridge PRIVATE advapi32)
+    add_dependencies(shadps4 dlssnr_bridge)
 endif()
 
 if (NOT MSVC)

@@ -14,6 +14,7 @@
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include <boost/container/small_vector.hpp>
 
@@ -67,6 +68,7 @@ Scheduler::~Scheduler() {
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
+    Vulkan::DrawPipe::CheckOwner("Scheduler::BeginRendering");
     if (is_rendering && render_state == new_state) {
         return;
     }
@@ -122,6 +124,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering() {
+    Vulkan::DrawPipe::CheckOwner("Scheduler::EndRendering");
     if (!is_rendering) {
         return;
     }
@@ -148,6 +151,7 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
+    Vulkan::DrawPipe::CheckOwner("Scheduler::Flush");
     // When flushing, we only send data to the driver; no waiting is necessary.
     SubmitExecution(info);
 }
@@ -443,6 +447,12 @@ void Scheduler::ClaimRecorder() {
     }
 }
 
+void Scheduler::AllowSecondRecorder(u32 tid) {
+    if (recorder) {
+        recorder->AllowSecondProducer(tid);
+    }
+}
+
 void Scheduler::SelectRecordingMode() {
     if (!recorder) {
         return;
@@ -468,6 +478,7 @@ void Scheduler::BeginRecorded(vk::CommandBuffer fake) {
 }
 
 void Scheduler::PopPendingOperations() {
+    Vulkan::DrawPipe::CheckOwner("Scheduler::PopPendingOperations");
     std::unique_lock lk(pending_ops_mutex);
     work_semaphore.Refresh();
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {

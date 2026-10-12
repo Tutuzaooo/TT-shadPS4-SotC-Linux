@@ -6,6 +6,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
+#include <deque>
+#include <optional>
 #include <exception>
 #include <mutex>
 #include <semaphore>
@@ -63,6 +65,8 @@ struct Liverpool {
     Regs regs{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    /// Register blocks written since the rasterizer last handed a draw to the draw pipe
+    RegDirty pipe_dirty;
 
 public:
     explicit Liverpool();
@@ -186,12 +190,35 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    static constexpr u64 NoSeq = ~0ULL;
+    /// `seq`: the number of a top-level submission (draw preparation, vk_draw_prep.h)
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = NoSeq);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
+    /// A submission of queue `qid` is done: the guest sees one less. In order after its draws
+    void FinishSubmission(u32 qid);
+    /// The work of an end-of-pipe event (fence, label, interrupt). Runs on the draw recording
+    /// thread when the draw pipe queues fences
+    void RunEventWriteEop(const struct PM4CmdEventWriteEop* event_eop);
+    void RunEventWriteEos(const struct PM4CmdEventWriteEos* event_eos);
+    void RunReleaseMem(u32 vqid, const struct PM4CmdReleaseMem* release_mem);
+    /// The guest follows a compute queue's read pointer: it advances in order with the work
+    void AdvanceAscRead(u32 vqid, u32 dwords);
+    /// Draw pipe: labels that fences queued for the draw recording thread will write. A
+    /// WAIT_REG_MEM that such a value satisfies does not need to wait for that thread: it runs
+    /// everything in command order anyway. Command processor thread only
+    struct PipeFence {
+        VAddr addr;
+        u64 value;
+        u32 bytes;
+        u64 position;
+    };
+    std::deque<PipeFence> pipe_fences;
+    void PrunePipeFences();
+    std::optional<u32> PipeFenceDword(VAddr addr);
     /// Perf stats: a label written by the submission `qid` is processing (label_lag_ms)
     void RecordLabelLag(u32 qid);
     void Process(std::stop_token stoken);
@@ -211,6 +238,7 @@ private:
     u32 num_mapped_queues{1u}; // GFX is always available
 
     VAddr indirect_args_addr{};
+    u64 next_gfx_seq{}; ///< under the graphics queue's m_access
     u32 num_counter_pairs{};
     u64 pixel_counter{};
 

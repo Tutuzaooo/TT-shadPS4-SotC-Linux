@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -15,6 +18,7 @@
 
 #include "common/lru_cache.h"
 #include "common/multi_level_page_table.h"
+#include "common/perf_stats.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/texture_cache/blit_helper.h"
@@ -128,6 +132,12 @@ public:
         RefreshImage(image);
     }
 
+    /// Update a render or depth target on the command processor thread
+    /// Skip the lock only if the image is clean, tracked and
+    /// already touched this GC tick
+    /// Guest writes and image unmaps must not have changed its pages
+    void UpdateTarget(ImageId image_id);
+
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
                                                                BindingType binding,
@@ -229,6 +239,9 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// Video memory ran out: frees every cached image not used in the last few submits.
+    void EmergencyCollect();
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -267,6 +280,22 @@ public:
         });
         for (const ImageId image_id : images) {
             slot_images[image_id].flags &= ~ImageFlagBits::Picked;
+        }
+    }
+
+    /// Images that start at `cpu_addr`. An image is registered in every page it covers, so they
+    /// are all in the bucket of its first page (upstream #5240)
+    template <typename Func>
+    void ForEachImageWithAddress(VAddr cpu_addr, Func&& func) {
+        const auto it = page_table.find(cpu_addr >> Traits::PAGE_BITS);
+        if (it == nullptr) {
+            return;
+        }
+        for (const ImageId image_id : *it) {
+            Image& image = slot_images[image_id];
+            if (image.info.guest_address == cpu_addr) {
+                func(image_id, image);
+            }
         }
     }
 
@@ -318,6 +347,19 @@ private:
 
     std::atomic<u64> image_set_generation{0};
     std::unique_ptr<std::atomic<u64>[]> page_stamps;
+
+    /// Stamp affected 1 MiB pages before guest writes or unmaps change any image
+    void StampWrite(VAddr addr, u64 size);
+    [[nodiscard]] bool PagesWrittenSince(VAddr addr, u64 size, u64 generation) const noexcept;
+    std::atomic<u64> write_generation{1};
+    std::unique_ptr<std::atomic<u64>[]> write_stamps{
+        std::make_unique<std::atomic<u64>[]>(NumStampPages)};
+    /// SHADPS4_TARGET_FAST_VERIFY: each skip is checked under the lock, then
+    /// the full update runs anyway
+    const bool target_fast_verify{std::getenv("SHADPS4_TARGET_FAST_VERIFY") != nullptr};
+    /// In-run A/B of the skip: SHADPS4_AB_TOGGLE with "target_fast_update" in
+    /// SHADPS4_AB_TOGGLE_KEYS (no setting)
+    const bool target_fast_toggle{Common::PerfStats::AbToggleFollows("target_fast_update")};
     std::atomic<u64> stat_images{0};
     std::atomic<u64> stat_largest_image{0};
     /// Iterate over all page indices in a range
@@ -395,14 +437,27 @@ private:
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    bool small_vram = false;
+    /// How close the card is to full: 0 (room left) to 3; images go after fewer idle frames
+    u32 gc_level = 0;
+    u64 gc_driver_budget = 0;
+    u64 gc_headroom = 0;
+    std::chrono::steady_clock::time_point gc_tight_log_time{};
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    /// gc_tick at the start of each of the last 64 seconds, for image ages in seconds
+    std::array<u64, 64> gc_tick_at_second{};
+    u64 gc_second = 0;
+    u64 gc_freed_images = 0;
+    u64 gc_kept_images = 0;
+    std::chrono::steady_clock::time_point gc_report_time{};
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
+    const bool gc_full_scan; ///< texture_gc_full_scan
     PageTable page_table;
     std::mutex mutex;
     std::mutex samplers_mutex;

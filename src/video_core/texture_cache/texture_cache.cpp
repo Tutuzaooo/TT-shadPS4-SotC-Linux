@@ -16,8 +16,10 @@
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -25,10 +27,16 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
+#include <vk_mem_alloc.h>
+
 namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+// GC ticks an image must stay unused before the GC frees it
+// below the pressure threshold
+[[maybe_unused]] static constexpr u64 GcIdleTicks = 16;
+[[maybe_unused]] static constexpr u64 GcFullScanIdleTicks = 300; // texture_gc_full_scan
 
 /// Hashes guest memory through its physical backing, like XXH3_64bits over the guest range. A direct read can
 /// fault, and inside the fault handler a nested fault on memory the tracker does not handle (not GPU mapped,
@@ -61,7 +69,8 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
-      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
+      gc_full_scan{EmulatorSettings.IsTextureGcFullScan()} {
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -73,27 +82,53 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         trigger_gc_memory = 0;
         pressure_gc_memory = DEFAULT_PRESSURE_GC_MEMORY;
         critical_gc_memory = DEFAULT_CRITICAL_GC_MEMORY;
-        return;
+    } else {
+        s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
+        // PINK_VRAM_LIMIT_MB=<n>: collect images as if the card had only n MiB to spend.
+        if (const char* v = std::getenv("PINK_VRAM_LIMIT_MB")) {
+            const s64 limit = std::strtoll(v, nullptr, 10) * s64{1_MB};
+            if (limit >= s64{1_GB}) {
+                device_local_memory = std::min(device_local_memory, limit);
+            }
+        }
+        const s64 min_spacing_expected = device_local_memory - 1_GB;
+        const s64 min_spacing_critical = device_local_memory - 512_MB;
+        const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
+        const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
+        const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
+        pressure_gc_memory = static_cast<u64>(std::max<u64>(
+            std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
+            DEFAULT_PRESSURE_GC_MEMORY));
+        critical_gc_memory = static_cast<u64>(std::max<u64>(
+            std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
+            DEFAULT_CRITICAL_GC_MEMORY));
+        trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+        // Buffer arena memory competes for the same budget, so on cards with 8 GB or less start
+        // aggressive image collection well before the budget is reached.
+        small_vram = device_local_memory <= s64{8_GB};
+        if (small_vram) {
+            critical_gc_memory = std::min<u64>(critical_gc_memory, device_local_memory * 6 / 10);
+            pressure_gc_memory = std::min<u64>(pressure_gc_memory, critical_gc_memory);
+        }
+        LOG_WARNING(Render, "Image GC: budget {} MiB, pressure {} MiB, critical {} MiB",
+                    device_local_memory >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20);
     }
 
-    const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
-    const s64 min_spacing_expected = device_local_memory - 1_GB;
-    const s64 min_spacing_critical = device_local_memory - 512_MB;
-    const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
-    const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
-    const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
-    pressure_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
-                      DEFAULT_PRESSURE_GC_MEMORY));
-    critical_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
-                      DEFAULT_CRITICAL_GC_MEMORY));
-    trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+    if (const u32 trigger_mb = EmulatorSettings.GetTextureGcTriggerMb(); trigger_mb != 0) {
+        trigger_gc_memory = u64{trigger_mb} * 1_MB;
+        LOG_WARNING(Render_Vulkan, "Workaround texture_gc_trigger_mb enabled: {} MB", trigger_mb);
+    }
+    if (gc_full_scan) {
+        LOG_WARNING(Render_Vulkan, "Workaround texture_gc_full_scan enabled");
+    }
+    LOG_INFO(Render_Vulkan, "Texture GC thresholds: trigger {} MB, pressure {} MB, critical {} MB",
+             trigger_gc_memory / 1_MB, pressure_gc_memory / 1_MB, critical_gc_memory / 1_MB);
 }
 
 TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
+    Vulkan::DrawPipe::CheckOwner("TextureCache::ProcessDownloadImages");
     std::unique_lock lk{download_images_mutex};
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id, true);
@@ -170,6 +205,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+    StampWrite(pages_start, pages_end - pages_start);
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
@@ -212,6 +248,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     std::scoped_lock lk{mutex};
+    StampWrite(cpu_addr, size);
 
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
@@ -545,6 +582,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+    Vulkan::DrawPipe::CheckOwner("TextureCache::FindImage");
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
@@ -610,7 +648,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
-        image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+        image_id = slot_images.insert(instance, runtime, slot_image_views, info,
+                                      desc.type == BindingType::Texture);
         RegisterImage(image_id);
     }
 
@@ -631,10 +670,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
-    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
-        if (image.info.guest_address != address) {
-            return;
-        }
+    ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
         if (ensure_valid && !image.SafeToDownload()) {
             return;
         }
@@ -681,7 +717,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
-    UpdateImage(image_id);
+    UpdateTarget(image_id);
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
@@ -703,7 +739,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
-    UpdateImage(image_id);
+    UpdateTarget(image_id);
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
@@ -716,12 +752,16 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
         ImageId stencil_id{};
-        ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
-                             [&](ImageId image_id, Image& image) {
-                                 if (image.info.guest_address == desc.info.stencil_addr) {
-                                     stencil_id = image_id;
-                                 }
-                             });
+        ForEachImageInRegion(
+            desc.info.stencil_addr, desc.info.stencil_size, [&](ImageId image_id, Image& image) {
+                if (image.info.guest_address != desc.info.stencil_addr) {
+                    return;
+                }
+                if (image.info.pixel_format == vk::Format::eUndefined ||
+                    Vulkan::LiverpoolToVK::IsFormatStencilCompatible(image.info.pixel_format)) {
+                    stencil_id = image_id;
+                }
+            });
         if (!stencil_id) {
             ImageInfo info{};
             info.guest_address = desc.info.stencil_addr;
@@ -866,6 +906,10 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
+    // UpdateTarget: an image can also be freed off the command processor thread
+    // outside InvalidateMemory and UnmapMemory (FindImage of a video out buffer
+    // registered by the guest)
+    StampWrite(image.info.guest_address, image.info.guest_size);
     image.flags &= ~ImageFlagBits::Registered;
     StampPages(image.info.guest_address, image.info.guest_size,
                image_set_generation.fetch_add(1, std::memory_order_acq_rel) + 1);
@@ -999,45 +1043,244 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
 }
 
-void TextureCache::GarbageCollectImages() {
-    if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
-    }
-    if (total_used_memory < trigger_gc_memory) {
+void TextureCache::EmergencyCollect() {
+    // May be reached from an image upload that already holds the cache lock (FindImage expanding
+    // an image): nothing can be freed safely then.
+    std::unique_lock lock{mutex, std::try_to_lock};
+    if (!lock) {
+        LOG_WARNING(Render, "Emergency texture collection skipped, the cache is in use");
         return;
     }
+    size_t num_deletions = 512;
+    size_t freed = 0;
+    const u64 ticks = std::min<u64>(4, gc_tick);
+    lru_cache.ForEachItemBelow(gc_tick - ticks, [&](ImageId image_id) {
+        if (num_deletions == 0) {
+            return true;
+        }
+        auto& image = slot_images[image_id];
+        if (image.SafeToDownload()) {
+            if (image.info.IsTiled()) {
+                return false; // Can't download non-linear images yet
+            }
+            DownloadImageMemory(image_id);
+        }
+        FreeImage(image_id);
+        --num_deletions;
+        ++freed;
+        return false;
+    });
+    LOG_WARNING(Render, "Emergency texture collection freed {} images", freed);
+}
+
+void TextureCache::GarbageCollectImages() {
+    const auto now = std::chrono::steady_clock::now();
+    gc_level = 0;
+    if (instance.CanReportMemoryUsage()) {
+        // How much the card still has for this process: what the driver allows less what is in
+        // use, where the free space inside the allocator's blocks counts as available (images and
+        // buffer arena memory are placed there). The fixed thresholds below know nothing of this:
+        // "used" is far above "critical" all the time and the collector frees what was idle for
+        // 80 frames whether the card has 2 GB left or nothing. Close to full, images go sooner.
+        // PINK_GC_TIGHT=0 turns this off.
+        static const bool tight_enabled = [] {
+            const char* v = std::getenv("PINK_GC_TIGHT");
+            return !v || v[0] != '0';
+        }();
+        u64 usage = 0;
+        gc_driver_budget = instance.GetDeviceMemoryBudget(&usage);
+        total_used_memory = usage;
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+        vmaGetHeapBudgets(instance.GetAllocator(), budgets);
+        const auto& memory_props = instance.GetMemoryProperties();
+        u64 allocator_free = 0;
+        for (u32 heap = 0; heap < memory_props.memoryHeapCount; ++heap) {
+            if (memory_props.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                allocator_free +=
+                    budgets[heap].statistics.blockBytes - budgets[heap].statistics.allocationBytes;
+            }
+        }
+        const u64 in_use = usage - std::min(usage, allocator_free);
+        gc_headroom = gc_driver_budget > in_use ? gc_driver_budget - in_use : 0;
+        if (tight_enabled) {
+            gc_level = gc_headroom < 384_MB ? 3 : gc_headroom < 640_MB ? 2 : gc_headroom < 1_GB;
+        }
+        if (gc_level >= 2 && now - gc_tight_log_time >= std::chrono::seconds{30}) {
+            gc_tight_log_time = now;
+            LOG_WARNING(Render,
+                        "Video memory is tight: {} MiB left of the {} MiB the driver allows ({} "
+                        "MiB in use by the emulator, {} MiB of it free inside allocator blocks, "
+                        "buffer arenas {} MiB, images {} MiB); freeing images sooner (level {})",
+                        gc_headroom >> 20, gc_driver_budget >> 20, usage >> 20,
+                        allocator_free >> 20, buffer_cache.ResidentBytes() >> 20,
+                        UniqueImage::live_bytes.load() >> 20, gc_level);
+        }
+    }
+    // gc_tick advances once per guest submission, hundreds of times a second: remember it at the
+    // start of each second so that an image's age can be compared in seconds (from bbport)
+    const u64 second = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
+    if (second != gc_second) {
+        gc_second = second;
+        gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+    }
+    // PINK_GC_IDLE_SECONDS=<n>: below the pressure mark an image goes only once unused for n seconds
+    // (default 20, at most 63) instead of 16 ticks, a few frames, which evicted textures briefly
+    // off screen and uploaded them again. 0 restores the 16 ticks.
+    static const u64 idle_seconds = [] {
+        const char* v = std::getenv("PINK_GC_IDLE_SECONDS");
+        return std::min<u64>(v ? std::strtoull(v, nullptr, 10) : 20, 63);
+    }();
+    // PINK_GC_SKIP_KEPT=0 restores the collector that let images it cannot free use up its deletions
+    static const bool skip_kept = [] {
+        const char* v = std::getenv("PINK_GC_SKIP_KEPT");
+        return !v || std::strtoull(v, nullptr, 10) != 0;
+    }();
+    const auto report = [&](bool locked) {
+        // With SHADPS4_PERF_STATS: what the collector did in the last 10 s
+        if (!Common::PerfStats::Enabled() || now - gc_report_time < std::chrono::seconds{10}) {
+            return;
+        }
+        LOG_WARNING(Render,
+                    "Image GC: used {} MiB, {} MiB of it buffer arenas (pressure {}, critical {}): "
+                    "{} images freed, {} kept (GPU-written) in the last 10 s; driver allows {} "
+                    "MiB, {} MiB left, level {}",
+                    total_used_memory >> 20, buffer_cache.ResidentBytes() >> 20,
+                    pressure_gc_memory >> 20, critical_gc_memory >> 20, gc_freed_images,
+                    gc_kept_images, gc_driver_budget >> 20, gc_headroom >> 20, gc_level);
+        gc_report_time = now;
+        gc_freed_images = gc_kept_images = 0;
+        if (!locked) {
+            return;
+        }
+        // Where the video memory is: every registered image by what the collector can do with it
+        struct Group {
+            u64 count{};
+            u64 bytes{};
+            void Add(u64 size) {
+                ++count;
+                bytes += size;
+            }
+        };
+        Group all, kept, linear_gpu, idle, big;
+        u64 backings = 0;
+        const u64 old_tick = gc_tick - std::min<u64>(160, gc_tick);
+        lru_cache.ForEachItemBelow(gc_tick, [&](ImageId image_id) {
+            const auto& image = slot_images[image_id];
+            u64 size = 0;
+            for (const auto& backing : image.backing_images) {
+                size += backing.image.size_bytes;
+                ++backings;
+            }
+            all.Add(size);
+            const bool gpu_written = image.SafeToDownload();
+            if (gpu_written && image.info.IsTiled()) {
+                kept.Add(size);
+            } else if (gpu_written) {
+                linear_gpu.Add(size);
+            }
+            if (image.lru_touch_tick != ~0ULL && image.lru_touch_tick < old_tick) {
+                idle.Add(size);
+            }
+            if (size >= 32_MB) {
+                big.Add(size);
+            }
+            return false;
+        });
+        // The allocator's share of video memory: what it took from the driver (blocks) and what
+        // is in use inside those blocks (images and buffers); the difference is free space it holds
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+        vmaGetHeapBudgets(instance.GetAllocator(), budgets);
+        const auto& memory_props = instance.GetMemoryProperties();
+        u64 vma_blocks = 0;
+        u64 vma_allocated = 0;
+        u64 driver_usage = 0;
+        u64 driver_budget = 0;
+        for (u32 heap = 0; heap < memory_props.memoryHeapCount; ++heap) {
+            if (!(memory_props.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+                continue;
+            }
+            vma_blocks += budgets[heap].statistics.blockBytes;
+            vma_allocated += budgets[heap].statistics.allocationBytes;
+            driver_usage += budgets[heap].usage;
+            driver_budget += budgets[heap].budget;
+        }
+        const auto [ring_bytes, large_bytes] =
+            runtime.GetStagingPool().HeldBytes(MemoryType::DeviceLocal);
+        LOG_WARNING(Render,
+                    "Video memory: driver reports {} of {} MiB; allocator blocks {} MiB with {} "
+                    "MiB in use (images {} MiB, the rest buffers); device-local staging: ring {} "
+                    "MiB, dedicated {} MiB; buffer arenas {} MiB",
+                    driver_usage >> 20, driver_budget >> 20, vma_blocks >> 20, vma_allocated >> 20,
+                    UniqueImage::live_bytes.load() >> 20, ring_bytes >> 20, large_bytes >> 20,
+                    buffer_cache.ResidentBytes() >> 20);
+        LOG_WARNING(Render,
+                    "Image GC detail: host images {} = {} MiB alive; "
+                    "registered {} = {} MiB in {} backings; GPU-written tiled (cannot be freed) "
+                    "{} = {} MiB; GPU-written linear {} = {} MiB; unused for 160 ticks {} = {} "
+                    "MiB; 32 MiB or larger {} = {} MiB; tick {}",
+                    UniqueImage::live_count.load(), UniqueImage::live_bytes.load() >> 20, all.count, all.bytes >> 20, backings, kept.count,
+                    kept.bytes >> 20, linear_gpu.count, linear_gpu.bytes >> 20, idle.count,
+                    idle.bytes >> 20, big.count, big.bytes >> 20, gc_tick);
+    };
+    if (total_used_memory < trigger_gc_memory) {
+        report(false);
+        return;
+    }
+    // The tick at the start of that second (an older one when no submission came then)
+    const u64 idle_tick =
+        idle_seconds != 0
+            ? gc_tick_at_second[(second - idle_seconds) % gc_tick_at_second.size()]
+            : ~0ULL;
     std::scoped_lock lock{mutex};
     bool pressured = false;
     bool aggresive = false;
-    u64 ticks_to_destroy = 0;
+    u64 below_tick = 0;
     size_t num_deletions = 0;
+    u32 visited = 0;
 
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
-        ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
-        ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
-        num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+        static constexpr std::array<u64, 4> TightTicks = {~0ULL, 48, 24, 8};
+        const u64 ticks_to_destroy = std::min<u64>(
+            {u64{aggresive ? 160u : pressured ? 80u : 16u}, TightTicks[gc_level], gc_tick});
+        below_tick = gc_tick - ticks_to_destroy;
+        if (!pressured && !aggresive && gc_level == 0) {
+            below_tick = std::min(below_tick, idle_tick);
+        }
+        num_deletions = aggresive ? (small_vram ? 128 : 40) : pressured ? 20 : 10;
+        if (gc_level != 0) {
+            num_deletions = std::max<size_t>(num_deletions, 64u << gc_level);
+        }
+        visited = 0;
     };
     const auto clean_up = [&](ImageId image_id) {
-        if (num_deletions == 0) {
+        if (num_deletions == 0 || ++visited > (gc_level >= 2 ? 2048u : 512u)) {
             return true;
         }
-        --num_deletions;
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            // This is a workaround for now. We can't handle non-linear image downloads.
+        // GPU-written images cannot go now: tiled ones cannot be written back at all (a workaround
+        // for now, non-linear image downloads are not handled), linear ones only under pressure.
+        // From bbport: they neither use up the deletions nor stay first in line. With the oldest
+        // images all being such render targets the collector freed nothing and VRAM only grew.
+        if ((tiled && download) || (download && !pressured)) {
+            if (skip_kept) {
+                TouchImage(image);
+            } else {
+                --num_deletions;
+            }
+            ++gc_kept_images;
             return false;
         }
-        if (download && !pressured) {
-            return false;
-        }
+        --num_deletions;
         if (download) {
             DownloadImageMemory(image_id);
         }
         FreeImage(image_id);
+        ++gc_freed_images;
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
@@ -1054,13 +1297,14 @@ void TextureCache::GarbageCollectImages() {
 
     // Try to remove anything old enough and not high priority.
     configure(false);
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    lru_cache.ForEachItemBelow(below_tick, clean_up);
 
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
-        lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        lru_cache.ForEachItemBelow(below_tick, clean_up);
     }
+    report(true);
 }
 
 void TextureCache::GarbageCollectSamplers() {
@@ -1104,6 +1348,7 @@ void TextureCache::GarbageCollectSamplers() {
 }
 
 void TextureCache::RunGarbageCollector() {
+    Vulkan::DrawPipe::CheckOwner("TextureCache::RunGarbageCollector");
     SCOPE_EXIT {
         ++gc_tick;
     };
@@ -1145,6 +1390,78 @@ void TextureCache::StampPages(VAddr addr, u64 size, u64 generation) {
             page_stamps[page].store(generation, std::memory_order_release);
         }
     });
+}
+
+void TextureCache::StampWrite(VAddr addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    const u64 generation = write_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 page_end = std::min((addr + size - 1) >> Traits::PAGE_BITS, NumStampPages - 1);
+    for (u64 page = addr >> Traits::PAGE_BITS; page <= page_end; ++page) {
+        write_stamps[page].store(generation, std::memory_order_relaxed);
+    }
+    // The stamps go before the image fields the caller changes next (UpdateTarget reads
+    // them the other way round)
+    std::atomic_thread_fence(std::memory_order_release);
+}
+
+bool TextureCache::PagesWrittenSince(VAddr addr, u64 size, u64 generation) const noexcept {
+    const u64 page_end = (addr + size - 1) >> Traits::PAGE_BITS;
+    if (size == 0 || page_end >= NumStampPages) {
+        return true;
+    }
+    for (u64 page = addr >> Traits::PAGE_BITS; page <= page_end; ++page) {
+        if (write_stamps[page].load(std::memory_order_relaxed) > generation) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void TextureCache::UpdateTarget(ImageId image_id) {
+    const Image& image = slot_images[image_id];
+    const VAddr begin = image.info.guest_address;
+    const VAddr end = begin + image.info.guest_size;
+    const auto unchanged = [&](const Image& img) {
+        return True(img.flags & ImageFlagBits::Registered) &&
+               False(img.flags & ImageFlagBits::Dirty) && img.track_addr == begin &&
+               img.track_addr_end == end && img.lru_touch_tick == gc_tick;
+    };
+    // Read image fields before page stamps when checking an update without the lock
+    // Guest writes stamp the pages first, so a concurrent change rejects the skip
+    if (image.target_write_gen != 0 && Common::PerfStats::AbToggleOn(target_fast_toggle) &&
+        unchanged(image)) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (!PagesWrittenSince(begin, end - begin, image.target_write_gen)) {
+            Common::PerfStats::Add(Common::PerfStats::Id::TargetUpdatesSkipped);
+            if (!target_fast_verify) {
+                return;
+            }
+            std::scoped_lock lk{mutex};
+            if (const Image& locked = slot_images[image_id]; !unchanged(locked)) {
+                Common::PerfStats::Add(Common::PerfStats::Id::TargetSkipMismatches);
+                static std::atomic<u32> reports{};
+                if (reports.fetch_add(1, std::memory_order_relaxed) < 20) {
+                    LOG_ERROR(Render_Vulkan,
+                              "Target fast verify: skipped the update of addr={:#x} size={:#x} "
+                              "flags={:#x} track={:#x}-{:#x} touch={} gc_tick={}",
+                              begin, end - begin, static_cast<u32>(locked.flags),
+                              locked.track_addr, locked.track_addr_end, locked.lru_touch_tick,
+                              gc_tick);
+                }
+            }
+        }
+    }
+    std::scoped_lock lk{mutex};
+    // Fetch the image again under the lock
+    // Guest video buffer registration can grow slot_images while this thread waits
+    Image& locked = slot_images[image_id];
+    TrackImage(image_id);
+    TouchImage(locked);
+    RefreshImage(locked);
+    // Writers bump the generation under the lock: any later one stamps a newer value
+    locked.target_write_gen = write_generation.load(std::memory_order_relaxed);
 }
 
 void TextureCache::TouchReusedImage(ImageId image_id) {

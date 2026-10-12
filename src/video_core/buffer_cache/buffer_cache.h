@@ -8,8 +8,11 @@
 #include <chrono>
 #include <deque>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
 
+#include "common/spin_lock.h"
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -36,6 +39,7 @@ namespace VideoCore {
 
 class TextureCache;
 class MemoryTracker;
+class BpeHeapGuard;
 class PageManager;
 
 class BufferCache {
@@ -98,10 +102,23 @@ public:
     /// Returns a guest stack range that stopped being a stack to normal tracking, CPU-modified
     void ReleaseCpuAuthoritativeRange(VAddr device_addr, u64 size);
 
+    /// After a handled guest write fault at `device_addr`: stops write tracking for the rest of the
+    /// window around it (PINK_FAULT_WINDOW_KB, see the definition)
+    void ExtendWriteFault(VAddr device_addr);
+
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
                                                              bool is_texel_buffer = false);
+
+    /// Make ranges read by shader DMA resident
+    /// Keep these allocations during idle eviction because they
+    /// have no binding timestamps
+    void ObtainFaultedRange(VAddr device_addr, u32 size) {
+        fault_obtain = true;
+        (void)ObtainBuffer(device_addr, size, false);
+        fault_obtain = false;
+    }
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
@@ -126,6 +143,15 @@ public:
     CleanRead ReadCleanPage(VAddr addr, void* out, u32 size);
     /// `generation` is MappingGeneration() read before checking that the page is GPU mapped
     bool FillCleanPage(VAddr page_addr, u64 generation);
+    /// Draw pipe: clean reads now come from another thread than the one that binds buffers
+    void ShareCleanPages() {
+        clean_shared = true;
+    }
+    /// Video (or system) memory bound to the buffer arenas so far; it is never released
+    [[nodiscard]] u64 ResidentBytes() const {
+        return resident_bytes.load(std::memory_order_relaxed);
+    }
+
     [[nodiscard]] u64 MappingGeneration() const {
         return clean_map_generation.load(std::memory_order_acquire);
     }
@@ -200,6 +226,17 @@ private:
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
+    /// readback_hot_regions: a readback window requested now;
+    /// returns whether the key is on
+    bool TouchHotReadback(VAddr addr, u64 size);
+
+    /// readback_hot_regions: records copies of the GPU-written bytes of the other
+    /// recent readback windows into hot_buffer, before the readback drains the GPU
+    void RecordHotDownloads(VAddr skip_addr);
+
+    /// readback_hot_regions: after the drain, writes the hot downloads to guest memory
+    void ApplyHotDownloads(BpeHeapGuard* heap_guard);
+
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
     /// Logs compute_loop_cap hits: the first one, then a count per minute
@@ -207,6 +244,54 @@ private:
 
     /// gpu_modified_ranges changed in [addr, addr + size): drop the clean pages there
     void InvalidateCleanPages(VAddr addr, u64 size);
+
+    /// range_fast_paths: whether the shortcuts run now
+    /// Without them the interval structures end up the same
+    bool RangeFastOn() const;
+    /// gpu_modified_ranges.Subtract; also drops the written-binding shortcuts it may
+    /// have made stale (key on or off)
+    void SubtractGpuModified(VAddr addr, u64 size);
+    /// Skip a repeated written binding only while its bytes and
+    /// stack ranges are unchanged
+    void AddGpuModified(VAddr addr, u64 size, bool fast);
+    /// sync_batch.Add
+    /// With `fast`, skipped when the same binding was added to this batch with
+    /// the same or a dominant flag
+    void AddToSyncBatch(VAddr addr, u64 size, bool is_written, bool fast);
+    /// Residency bitmap, kept with resident_ranges on or off (only
+    /// arena_evict_idle_s releases residency)
+    void MarkResident(u64 start_block, u64 end_block);
+    void ClearResident(u64 start_block, u64 end_block);
+    [[nodiscard]] bool IsResident(u64 first_block, u64 last_block) const;
+    /// SHADPS4_RANGE_FAST_VERIFY: counts and logs a shortcut that differs
+    /// from the interval structures
+    void RangeFastMismatch(const char* what, VAddr addr, u64 size);
+    /// arena_evict_idle_s: a binding uses [addr, addr + size) of the arena now
+    void TouchArenaUse(VAddr addr, u64 size) {
+        const u32 now = arena_now_s;
+        for (u64 g = addr >> ArenaUseGranuleBits; g <= (addr + size - 1) >> ArenaUseGranuleBits;
+             ++g) {
+            arena_use[g] = now;
+        }
+    }
+    /// arena_evict_idle_s: once a second, the allocations no binding used for the set
+    /// time and that hold no GPU-written bytes leave the arena
+    /// Called between frames
+    void ScanArenaAllocations();
+    /// arena_evict_idle_s: takes the ranges of one allocation out of the arena now; the
+    /// unbind and the free wait for the GPU
+    void EvictArenaAllocation(vk::DeviceMemory memory, u64 bytes, std::span<const Interval> ranges);
+    /// arena_evict_idle_s: queues the unbinds whose GPU work finished (before a
+    /// submit), and frees the memory earlier unbinds released
+    void QueueArenaUnbinds();
+    void FreeUnboundArenaMemory();
+    [[nodiscard]] std::string ArenaEvictReport() const;
+    /// A written binding of [addr, addr + size) is in the sync batch
+    [[nodiscard]] bool IsPendingWrittenSync(VAddr addr, u64 size) const;
+
+    /// range_fast_paths: the DMA sweep's resident ranges (or stack-free pieces) merged
+    /// into the sync batch in one pass
+    void AddDmaSweepSorted(bool skip_stacks);
 
     enum class WriterState { Current, Busy, Done };
     /// Idea B: stores [addr, addr + size) as written by the command buffer being recorded. `open`: a
@@ -248,6 +333,26 @@ private:
     static constexpr size_t NumCleanPages = 1024;
     std::array<CleanPage, NumCleanPages> clean_pages{};
     bool clean_pages_used = false; // Set by the first FillCleanPage
+    // Draw pipe: the command processor thread serves clean reads while the draw recording thread
+    // changes gpu_modified_ranges. Changes of the set and of the clean pages, and the clean reads,
+    // take this lock then (ShareCleanPages); reads of the set by its writer thread need none
+    Common::SpinLock clean_lock;
+    bool clean_shared = false;
+    struct CleanGuard {
+        explicit CleanGuard(BufferCache& cache_) : cache{cache_.clean_shared ? &cache_ : nullptr} {
+            if (cache) {
+                cache->clean_lock.lock();
+            }
+        }
+        ~CleanGuard() {
+            if (cache) {
+                cache->clean_lock.unlock();
+            }
+        }
+        CleanGuard(const CleanGuard&) = delete;
+        CleanGuard& operator=(const CleanGuard&) = delete;
+        BufferCache* cache;
+    };
     std::atomic<u64> clean_map_generation{};
     u32 loop_cap_hits_reported{};
     u32 loop_cap_hits_minute{};
@@ -263,6 +368,29 @@ private:
     boost::container::small_vector<std::pair<VAddr, u64>, 16> open_writes;
     const bool readback_ahead;
     const bool track_writers;
+    /// readback_hot_regions: readback windows requested in the last seconds
+    struct HotReadback {
+        VAddr addr;
+        u64 size;
+        std::chrono::steady_clock::time_point last_request;
+    };
+    std::vector<HotReadback> hot_readbacks;
+    /// readback_hot_regions: windows with copies recorded by
+    /// RecordHotDownloads, waiting for the drain
+    struct HotDownload {
+        const Buffer* arena;
+        VAddr addr;
+        u64 size;
+        u32 first_copy;
+        u32 num_copies;
+    };
+    std::vector<HotDownload> hot_downloads;
+    std::vector<vk::BufferCopy> hot_copies;
+    /// readback_hot_regions: host buffer the hot copies land in, reused by every drain
+    /// and grown in powers of two (a staging request of a different size each drain
+    /// allocated a dedicated buffer)
+    std::unique_ptr<Buffer> hot_buffer;
+    u64 hot_total{};
     // Frente J probe: the readback being downloaded was asked for by a guest thread's fault
     bool guest_readback{};
 
@@ -273,6 +401,54 @@ private:
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
+
+    /// arena_evict_idle_s: one entry per allocation EnsureResident made
+    struct ArenaAllocation {
+        u64 bytes;
+        bool pinned; ///< Made resident by a DMA fault: shaders read it without a binding, so it stays
+    };
+    std::unordered_map<VkDeviceMemory, ArenaAllocation> arena_allocations;
+    /// Evicted ranges (blocks) waiting until the GPU no longer runs
+    /// commands that may read them
+    struct PendingUnbind {
+        u64 tick;
+        vk::DeviceMemory memory;
+        u64 bytes;
+        std::vector<Interval> ranges;
+    };
+    std::deque<PendingUnbind> pending_unbinds;
+    /// Memory unbound by the submit of `tick`, freed once it ran
+    struct PendingFree {
+        u64 tick;
+        vk::DeviceMemory memory;
+        u64 bytes;
+    };
+    std::deque<PendingFree> pending_frees;
+    /// Evicted blocks not resident since (to count returns)
+    IntervalList<> evicted_blocks;
+    /// Seconds stamp of the last binding per 2 MiB of guest address space;
+    /// null when the key is off
+    static constexpr u64 ArenaUseGranuleBits = 21;
+    std::unique_ptr<u32[]> arena_use;
+    u32 arena_now_s{1};
+    const u32 arena_evict_idle_s;
+    std::chrono::steady_clock::time_point arena_epoch{};
+    std::chrono::steady_clock::time_point arena_last_scan{};
+    std::chrono::steady_clock::time_point arena_last_report{};
+    bool fault_obtain{};
+    /// Device memory bound to the sparse arenas, and the
+    /// eviction counters of the report
+    u64 arena_resident_bytes{};
+    struct ArenaEvictStats {
+        u64 pinned_bytes{};       ///< Last scan
+        u64 skipped_gpu_bytes{};  ///< Last scan: idle, but holding GPU-written bytes
+        u64 evicted_allocations{};
+        u64 evicted_bytes{};
+        u64 freed_bytes{};
+        u64 returned_bytes{};       ///< Evicted bytes a binding made resident again
+        u64 returned_fault_bytes{}; ///< Of those, by a DMA fault
+    };
+    ArenaEvictStats arena_stats;
     Vulkan::Semaphore memory_semaphore;
     /// Graphics tick that makes migrated arena bindings visible to transfer copies
     bool migration_binds_pending{};
@@ -289,6 +465,7 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    std::atomic<u64> resident_bytes{};
 
     struct SyncRange : Interval {
         bool written;
@@ -315,6 +492,43 @@ private:
     /// Stack generation used by the last covered DMA sweep
     const bool sweep_skip_stacks;
     const bool sweep_skip_toggle;
+    const bool readback_hot_regions;
+    const bool readback_hot_toggle;
+    /// range_fast_paths
+    const bool range_fast;
+    const bool range_fast_toggle;
+    const bool range_fast_verify;
+    static constexpr size_t NumRangeFastEntries = 256;
+    static size_t RangeFastSlot(VAddr addr, u64 size) {
+        return ((addr * 0x9E3779B97F4A7C15ULL) ^ (size * 0xC2B2AE3D27D4EB4FULL)) >> 56;
+    }
+    /// Cache written bindings whose non-stack bytes are marked
+    /// GPU-modified and clean pages dropped
+    /// SubtractGpuModified clears overlapping entries and size 0 marks an empty slot
+    struct WrittenEntry {
+        VAddr addr;
+        u64 size;
+        u64 stack_generation;
+    };
+    std::array<WrittenEntry, NumRangeFastEntries> written_entries{};
+    u32 written_entries_used{};
+    /// A binding added to the sync batch of `generation`; the batch only
+    /// grows until it is flushed
+    struct SyncEntry {
+        VAddr addr;
+        u64 size;
+        u64 generation;
+        bool written;
+    };
+    std::array<SyncEntry, NumRangeFastEntries> sync_entries{};
+    /// One bit per block, per arena page, allocated with the first
+    /// resident block of the page
+    std::array<std::unique_ptr<u64[]>, NUM_ARENA_PAGES> resident_bits{};
+    /// The DMA sweep's ranges, sorted and merged, for DomIntervalList::AddSorted
+    std::vector<SyncRange> dma_sweep_ranges;
+    u64 range_fast_written_hits{};
+    u64 range_fast_sync_hits{};
+    u64 range_fast_resident_hits{};
     u64 dma_sync_stack_generation{};
     /// Cached resident ranges with guest stacks removed
     std::vector<std::pair<VAddr, u64>> dma_sweep_pieces;

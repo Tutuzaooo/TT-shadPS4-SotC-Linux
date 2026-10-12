@@ -5,10 +5,13 @@
 
 #include <algorithm>
 #include <functional>
+#include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <utility>
 #include <variant>
 #include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
 #include <tsl/robin_map.h>
 #include "common/assert.h"
 #include "shader_recompiler/profile.h"
@@ -28,6 +31,8 @@ struct std::hash<vk::ShaderModule> {
 
 namespace AmdGpu {
 class Liverpool;
+union Regs;
+struct ShaderProgram;
 }
 
 namespace Serialization {
@@ -53,6 +58,10 @@ struct Program {
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
     Shader::Info info;
+    /// Draw preparation (vk_draw_prep.h): a copy of `info` as compiled, for helper threads, which
+    /// must not touch `info` (the command processor thread refreshes it for every draw). Set under
+    /// PipelineCache::programs_mutex.
+    std::unique_ptr<Shader::Info> info_template;
     ModuleList modules{};
     /// Keep the indices of occupied modules slots in ascending order so searches skip the empty
     /// slots
@@ -102,6 +111,51 @@ struct Program {
 struct DrawIndirectParams {
     u16 vertex_sgpr_offset;
     u32 instance_sgpr_offset;
+
+    bool operator==(const DrawIndirectParams&) const = default;
+};
+
+struct PrepWorker;
+struct PreparedDraw;
+
+/// The state one pipeline selection works on. The command processor thread selects with the
+/// pipeline cache's own members; a draw preparation helper (vk_draw_prep.h) with its own copies
+/// and its replayed registers, through the same code.
+struct PipelineSelection {
+    const AmdGpu::Regs& regs;
+    std::array<Shader::RuntimeInfo, MaxShaderStages>& runtime_infos;
+    std::array<const Shader::Info*, MaxShaderStages>& infos;
+    std::array<vk::ShaderModule, MaxShaderStages>& modules;
+    Shader::Gcn::FetchShaderData*& fetch_shader;
+    GraphicsPipelineKey& graphics_key;
+    const DrawIndirectParams& draw_indirect_params;
+    PrepWorker* worker; ///< set: lookups only, nothing is compiled or created
+};
+
+/// A draw preparation helper's selection state and its own copies of the programs' Info
+struct PrepWorker {
+    struct Stage {
+        const Program* program;
+        u64 hash;
+        Shader::HwStage hw_stage;
+        const std::vector<u32>* flat;
+    };
+    const AmdGpu::Regs* regs{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    Shader::Gcn::FetchShaderData* fetch_shader{};
+    GraphicsPipelineKey graphics_key{};
+    DrawIndirectParams draw_indirect_params{};
+    tsl::robin_map<const Program*, std::unique_ptr<Shader::Info>> program_infos;
+    boost::container::static_vector<Stage, MaxShaderStages> stages;
+    Shader::StageSpecialization spec;
+    bool failed = false;
+
+    PipelineSelection Selection() {
+        return {*regs,        runtime_infos,        infos, modules, fetch_shader,
+                graphics_key, draw_indirect_params, this};
+    }
 };
 
 class PipelineCache {
@@ -117,12 +171,33 @@ public:
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+    /// `prepared`: the draw preparation helpers' result for this draw, used when it was made from
+    /// the same registers (`state_hash`, vk_draw_prep.h) and the same guest memory
+    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
+                                                const PreparedDraw* prepared = nullptr,
+                                                u64 state_hash = 0);
+
+    /// Draw preparation helper: selects the pipeline of a draw from `worker.regs` without
+    /// compiling or creating anything. False when that would be needed, or on a guest memory
+    /// fault (the helper's recovery point).
+    bool PrepareGraphicsPipeline(PrepWorker& worker);
+
+    /// Draw preparation statistics (command processor thread)
+    struct PrepStats {
+        u64 used{};
+        u64 pending{};
+        u64 unavailable{};
+        u64 state_mismatch{};
+        u64 code_mismatch{};
+        u64 flat_mismatch{};
+        u64 no_pipeline{};
+    };
+    PrepStats prep_stats{};
 
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
-    Result GetProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+    Result GetProgram(PipelineSelection& sel, Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
@@ -137,6 +212,9 @@ public:
 
     /// Clean guest memory reader provided by the rasterizer
     std::function<bool(VAddr, void*, u64)> read_clean_memory;
+    /// Whether BindTextures binds this single T# as null
+    /// (Rasterizer::CheckBindableImage), set by the rasterizer
+    std::function<bool(const AmdGpu::Image&, const Shader::ImageResource&)> is_null_image;
 
 private:
     /// Cached shader metadata and the guest bytes used to find it
@@ -153,9 +231,21 @@ private:
     std::optional<Shader::ShaderParams> GetParamsCached(const Program& pgm);
     bool CachedBytesMatch(const u32* code, const CachedBinaryInfo& cached);
 
-    bool RefreshGraphicsKey();
-    bool RefreshGraphicsStages();
+    bool RefreshGraphicsKey(PipelineSelection& sel);
+    bool RefreshGraphicsStages(PipelineSelection& sel);
     bool RefreshComputeKey();
+
+    /// The command processor thread's selection (the members below)
+    PipelineSelection OwnSelection();
+    Result GetProgramForWorker(PrepWorker& worker, Shader::HwStage hw_stage,
+                               const Shader::ShaderParams& params,
+                               Shader::Backend::Bindings& binding,
+                               const Shader::RuntimeInfo& runtime_info);
+    /// A helper's shader parameters: from what the command processor thread found at that address
+    std::optional<Shader::ShaderParams> WorkerParams(const AmdGpu::ShaderProgram& pgm);
+    void PublishParams(const u32* code, u64 hash, u32 length);
+    const GraphicsPipeline* UsePrepared(const PreparedDraw& prepared, const DrawIndirectParams& params,
+                                        u64 state_hash);
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
@@ -163,8 +253,9 @@ private:
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
-                                   Shader::Backend::Bindings& binding);
-    const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
+                                   Shader::Backend::Bindings& binding, bool store = true);
+    const Shader::RuntimeInfo& BuildRuntimeInfo(PipelineSelection& sel, Shader::HwStage stage,
+                                                Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
@@ -181,6 +272,16 @@ private:
     Shader::Pools pools;
     DrawIndirectParams draw_indirect_params{};
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
+    /// Draw preparation: the command processor thread is the only writer of `program_cache` and
+    /// of the programs' permutation lists and takes this exclusively to change them; helpers read
+    /// them under it shared
+    std::shared_mutex programs_mutex;
+    struct PublishedParams {
+        u64 hash;
+        u32 length;
+    };
+    tsl::robin_map<const u32*, PublishedParams> published_params;
+    std::shared_mutex published_params_mutex;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};

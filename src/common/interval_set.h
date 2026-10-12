@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <concepts>
 #include <iterator>
+#include <span>
 #include <vector>
 
 #include "common/small_vector.h"
@@ -84,6 +85,32 @@ public:
         const auto at = std::distance(intervals.begin(), first);
         Splice(first, last, out, m);
         Coalesce(at, m);
+    }
+
+    /// Removes a range from the interval set; intervals cut by it
+    /// keep their part outside it
+    void Subtract(u64 start, u64 end) {
+        if (start >= end) [[unlikely]] {
+            return;
+        }
+        auto first = std::ranges::upper_bound(intervals, start, {}, &IV::end);
+        auto last = first;
+        while (last != intervals.end() && last->start < end) {
+            ++last;
+        }
+        if (first == last) {
+            return;
+        }
+        IV out[2];
+        std::size_t m = 0;
+        if (first->start < start) {
+            out[m++] = first->SubRange(first->start, start);
+        }
+        const auto prev = std::prev(last);
+        if (prev->end > end) {
+            out[m++] = prev->SubRange(end, prev->end);
+        }
+        Splice(first, last, out, m);
     }
 
     /// Returns immutable iterator to an interval that contains provided address.
@@ -262,4 +289,64 @@ struct DomIntervalList : public IntervalList<IV> {
         this->Splice(first, last, out.data(), out.size());
         this->Coalesce(at, out.size());
     }
+
+    /// Merge sorted, disjoint values in one pass with the same
+    /// result as repeated Add calls
+    /// Keep dominating intervals and merge compatible neighbors
+    void AddSorted(std::span<const IV> values) {
+        auto& in = this->intervals;
+        scratch.clear();
+        scratch.reserve(in.size() + values.size() * 2 + 1);
+        const auto push = [this](const IV& x) {
+            if (x.start >= x.end) {
+                return;
+            }
+            if (!scratch.empty() && scratch.back().end == x.start &&
+                scratch.back().CanMergeWith(x)) {
+                scratch.back().end = x.end;
+            } else {
+                scratch.push_back(x);
+            }
+        };
+        std::size_t i = 0;
+        for (const IV& v : values) {
+            if (v.start >= v.end) {
+                continue;
+            }
+            while (i < in.size() && in[i].end <= v.start) {
+                push(in[i++]);
+            }
+            if (i < in.size() && in[i].start < v.start) {
+                push(in[i].SubRange(in[i].start, v.start));
+                in[i] = in[i].SubRange(v.start, in[i].end);
+            }
+            u64 cur = v.start;
+            while (i < in.size() && in[i].start < v.end) {
+                const IV& it = in[i];
+                if (it.start > cur) {
+                    push(v.SubRange(cur, it.start));
+                    cur = it.start;
+                }
+                const u64 b = std::min(it.end, v.end);
+                push(it.Dominant(v) ? it.SubRange(cur, b) : v.SubRange(cur, b));
+                cur = b;
+                if (it.end > v.end) {
+                    // The tail meets the next values
+                    in[i] = it.SubRange(v.end, it.end);
+                    break;
+                }
+                ++i;
+            }
+            if (cur < v.end) {
+                push(v.SubRange(cur, v.end));
+            }
+        }
+        while (i < in.size()) {
+            push(in[i++]);
+        }
+        in.swap(scratch);
+    }
+
+private:
+    typename IntervalList<IV>::List scratch;
 };

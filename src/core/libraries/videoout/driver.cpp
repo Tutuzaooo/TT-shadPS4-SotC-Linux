@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <string_view>
+#include <cstdlib>
+#include <algorithm>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -345,7 +349,31 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);
 
-    Common::AccurateTimer timer{vblank_period};
+    // How a finished frame gets to the screen (PINK_FLIP_PACING):
+    //  ready    (default) as soon as it is there, once the flip rate's interval (33.3 ms at
+    //           30 Hz) has passed since the previous flip. The thread looks every eighth of a
+    //           vblank. Below the target rate the frame times follow the game (37 ms at 27 fps)
+    //           instead of jumping between vblank multiples, which a variable refresh or high
+    //           refresh display shows as it is.
+    //  interval on vblanks only, at least the flip rate's interval after the previous flip: a
+    //           late frame goes out on the next vblank (33/50/67 ms).
+    //  phase    on fixed vblanks, every second one at 30 Hz, as upstream (33/67/100 ms).
+    enum class Pacing { Ready, Interval, Phase };
+    const Pacing pacing = [] {
+        const char* env = std::getenv("PINK_FLIP_PACING");
+        const std::string_view value{env ? env : "ready"};
+        const Pacing mode = value == "phase"      ? Pacing::Phase
+                            : value == "interval" ? Pacing::Interval
+                                                  : Pacing::Ready;
+        LOG_WARNING(Lib_VideoOut, "Flip pacing: {}",
+                    mode == Pacing::Phase      ? "fixed vblanks"
+                    : mode == Pacing::Interval ? "next vblank after the flip interval"
+                                               : "when ready, after the flip interval");
+        return mode;
+    }();
+    // Vblanks keep their period; with Pacing::Ready the loop runs SubTicks times per vblank
+    const u32 sub_ticks = pacing == Pacing::Ready ? 8 : 1;
+    Common::AccurateTimer timer{vblank_period / sub_ticks};
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -357,21 +385,43 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
+    u64 last_flip_vblank = 0;
+    auto last_flip_time = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+    u32 sub_tick = 0;
     while (!token.stop_requested()) {
         timer.Start();
+        const bool vblank_tick = sub_tick == 0;
+        sub_tick = (sub_tick + 1) % sub_ticks;
 
         if (DebugState.IsGuestThreadsPaused()) {
-            DrawLastFrame();
+            if (vblank_tick) {
+                DrawLastFrame();
+            }
             timer.End();
             continue;
         }
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        const u64 flip_interval = static_cast<u64>(std::max(main_port.flip_rate, 0)) + 1;
+        bool flip_slot;
+        const auto now = std::chrono::steady_clock::now();
+        const std::chrono::steady_clock::time_point flip_due =
+            last_flip_time + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                 vblank_period * flip_interval);
+        if (pacing == Pacing::Ready) {
+            // Half a millisecond of tolerance for the timer
+            flip_slot = now + std::chrono::microseconds{500} >= flip_due;
+        } else if (pacing == Pacing::Interval) {
+            flip_slot = vblank_status.count - last_flip_vblank >= flip_interval;
+        } else {
+            flip_slot = vblank_status.count % flip_interval == 0;
+        }
+        if (flip_slot) {
             const auto request = receive_request();
             if (!request) {
-                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
+                // Dont draw too fast
+                if (vblank_tick && timer.GetTotalWait().count() < 0) {
                     if (!main_port.is_open) {
                         DrawBlankFrame();
                     } else if (ImGui::Core::MustKeepDrawing()) {
@@ -380,11 +430,15 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
             } else {
                 Flip(request);
+                last_flip_vblank = vblank_status.count;
+                // A frame that was there in time keeps the exact cadence of the flip rate (no
+                // drift from the time presenting takes); a late one starts a new cadence
+                last_flip_time = now - flip_due < vblank_period / 4 ? flip_due : now;
                 FRAME_END;
             }
         }
 
-        {
+        if (vblank_tick) {
             // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
             std::scoped_lock lock{main_port.vo_mutex};
 

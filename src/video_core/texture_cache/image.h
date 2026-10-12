@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "common/enum.h"
 #include "common/incremental_id.h"
 #include "common/types.h"
@@ -23,6 +24,7 @@ class Runtime;
 
 VK_DEFINE_HANDLE(VmaAllocation)
 VK_DEFINE_HANDLE(VmaAllocator)
+VK_DEFINE_HANDLE(VmaPool)
 
 namespace VideoCore {
 
@@ -37,6 +39,11 @@ enum ImageFlagBits : u32 {
     Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
+
+/// The pool small images take their memory from (image_memory_pool), for another user of the same
+/// memory type that should share the free space of its blocks. Null without the workaround or
+/// for sizes the pool does not serve.
+VmaPool SharedImagePool(VmaAllocator allocator, u32 memory_type_bits, u64 size);
 
 struct UniqueImage {
     explicit UniqueImage() = default;
@@ -62,7 +69,13 @@ struct UniqueImage {
         return *this;
     }
 
-    void Create(const vk::ImageCreateInfo& image_ci);
+    /// `texture`: made for a sampled T# (image_pool_texture_max_kb can
+    /// keep it out of the pool)
+    void Create(const vk::ImageCreateInfo& image_ci, bool texture = false);
+
+    /// Host images alive right now and their memory, for the collector's report
+    static inline std::atomic<u64> live_count{};
+    static inline std::atomic<u64> live_bytes{};
 
     void Destroy();
 
@@ -70,7 +83,7 @@ private:
     /// Create the image using memory from the pool when image_memory_pool is enabled and the image
     /// is supported
     /// Return false so the caller can use the normal allocation path otherwise
-    bool TryCreatePooled(const vk::ImageCreateInfo& image_ci);
+    bool TryCreatePooled(const vk::ImageCreateInfo& image_ci, bool texture);
 
 public:
     operator vk::Image() const {
@@ -91,8 +104,10 @@ public:
 };
 
 struct Image {
+    /// `texture`: made for a sampled T# (image_pool_texture_max_kb)
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
-                   Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
+                   Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info,
+                   bool texture = false);
     ~Image();
 
     Image(const Image&) = delete;
@@ -150,6 +165,13 @@ public:
     ImageFlagBits flags = ImageFlagBits::Dirty;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+    /// Remember the last GC tick that touched this image so repeated cached bindings
+    /// update its LRU position only once per tick
+    u64 lru_touch_tick{~0ULL};
+    /// Write generation at the last TextureCache::UpdateTarget that left
+    /// the image clean, 0 for none
+    /// Next to the other fields UpdateTarget reads, on one cache line
+    u64 target_write_gen{};
     ImageId depth_id{};
     u64 depth_uid{};
 
@@ -176,9 +198,6 @@ public:
     u64 image_uid{};
     u64 lru_id{};
     u64 tick_accessed_last{};
-    /// Remember the last GC tick that touched this image so repeated cached bindings update its LRU
-    /// position only once per tick
-    u64 lru_touch_tick{~0ULL};
     u64 hash{};
 
     struct {

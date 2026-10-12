@@ -14,6 +14,7 @@
 #include "common/logging/log.h"
 #include "common/perf_stats.h"
 #include "common/thread.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_recorder.h"
 
 #if defined(_M_X64) || defined(__x86_64__)
@@ -679,8 +680,9 @@ VkCommandBuffer CommandRecorder::Real(VkCommandBuffer fake) const noexcept {
 }
 
 void CommandRecorder::CheckProducer() {
+    DrawPipe::CheckOwner("the command recorder");
     static thread_local const u32 tid = CurrentThreadId();
-    if (tid == producer_tid) [[likely]] {
+    if (tid == producer_tid || tid == second_producer_tid) [[likely]] {
         return;
     }
     // Let the command processor take over once from the thread that created the renderer, and let

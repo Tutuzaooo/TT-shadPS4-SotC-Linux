@@ -5,13 +5,19 @@
 
 #include <array>
 #include <chrono>
+#include <memory>
+#include <vector>
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/regs.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/mapped_page_table.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bind_cache.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
+#include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -59,6 +65,15 @@ public:
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
 
+    /// gcn_unordered_dispatches: ring of the packets processed next (0 = graphics,
+    /// 1 + vqid = compute queue)
+    void SetCommandRing(u8 ring) noexcept {
+        command_ring = ring < MaxCommandRings ? ring : MaxCommandRings - 1;
+    }
+    /// gcn_unordered_dispatches: the game sent a sync packet (event write,
+    /// EOP/EOS/RELEASE_MEM, ACQUIRE_MEM, a wait) on the current ring
+    void OnGameSync();
+
     void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
         if (host_markers_enabled) {
             ScopeMarkerBegin(fmt::vformat(fmt, args));
@@ -82,6 +97,8 @@ public:
     /// since the previous packet. Returns false when the workaround is off
     bool WriteLodStats(VAddr address, u32 num_bytes);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// After InvalidateMemory handled a guest write fault at `addr` (see BufferCache::ExtendWriteFault)
+    void ExtendWriteFault(VAddr addr);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     void ReleaseCpuAuthoritativeRange(VAddr addr, u64 size);
     bool IsMapped(VAddr addr, u64 size);
@@ -92,7 +109,13 @@ public:
     bool ReadCleanMemory(VAddr addr, void* out, u64 size);
 
     /// Returns false for a T# that describes an image Vulkan cannot create (garbage descriptor)
-    bool IsPlausibleImage(const VideoCore::ImageInfo& info);
+    bool IsPlausibleImage(const VideoCore::ImageInfo& info, bool log = true);
+    /// Check whether the texture can be bound, or should use a null descriptor
+    /// Share the checks with descriptor arrays and return the built bound_desc
+    /// Enable log to report a rejection
+    bool CheckBindableImage(const AmdGpu::Image& tsharp, const Shader::ImageResource& image_desc,
+                            std::optional<VideoCore::TextureCache::ImageDesc>& bound_desc,
+                            bool log);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
@@ -104,6 +127,24 @@ public:
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
+    }
+
+    /// Draw preparation helpers (vk_draw_prep.h), null when off
+    DrawPreparation* GetDrawPreparation() {
+        return draw_prep.get();
+    }
+    /// Command processor thread: hash of the register state as it is now (draw preparation)
+    u64 CurrentStateHash();
+
+    /// Draw pipe (vk_draw_pipe.h): on the command processor thread, waits until the draw
+    /// recording thread has run every draw handed to it. That thread owns the caches, the
+    /// scheduler and the runtime while draws are in flight, so everything else the command
+    /// processor thread does on them comes here first. No-op without the pipe, with the pipe idle
+    /// and on other threads
+    void DrainDrawPipe(u32 reason = DrawPipe::ReasonRasterizer, u32 detail = 0) {
+        if (draw_pipe) [[unlikely]] {
+            DrainDrawPipeSlow(reason, detail);
+        }
     }
 
     template <typename Func>
@@ -120,7 +161,93 @@ public:
     u32 GetGpuCommandProcessorThreadId();
 #endif
 
+public:
+    /// Draw pipe: runs `task(context, data)` in order with the draws handed to the recording
+    /// thread: queued for that thread (from pipe mode `min_mode` on; `data` is copied), or here
+    /// after waiting for it. `reason` and `detail` label that wait in the statistics
+    using OrderedTask = void (*)(void* context, const u8* data);
+    /// Returns true when the task was queued (it has not run yet)
+    bool RunInOrder(OrderedTask task, void* context, const void* data, u32 size, u32 min_mode,
+                    u32 reason, u32 detail = 0);
+    /// Draw pipe: the position after the last queued packet, and whether the recording thread
+    /// has run everything up to a position
+    [[nodiscard]] u64 DrawPipeHead() const {
+        return draw_pipe ? draw_pipe->Head() : 0;
+    }
+    [[nodiscard]] bool DrawPipeReached(u64 position) const {
+        return !draw_pipe || draw_pipe->Reached(position);
+    }
+    /// PINK_DRAW_PIPE is at least `mode`
+    [[nodiscard]] bool DrawPipeModeAtLeast(u32 mode) const noexcept {
+        return static_cast<u32>(pipe_mode) >= mode;
+    }
+
 private:
+    /// Draw pipe, PINK_DRAW_PIPE=<n>. Each mode adds one thing to the previous one:
+    /// 0 off (default): draws run as before.
+    /// 1 packets on the same thread: a draw is written as a packet (changed register blocks, user
+    ///   data of its stages, parameters) and run from it at once. Tests that the packet carries
+    ///   everything the second half of a draw reads.
+    /// 2 lockstep: the packet runs on the draw recording thread while the command processor
+    ///   thread waits for it. Tests the second thread (faults, command recorder) without overlap.
+    /// 3 draws overlap: the command processor thread goes on decoding while draws are recorded;
+    ///   it waits before dispatches and everything else.
+    /// 4 dispatches are queued like draws.
+    /// 5 end-of-pipe events (fences, labels) are queued in order with the draws.
+    /// 6 fewer waits: the end of a submission is queued in order too, a WAIT_REG_MEM that
+    ///   already passes and EVENT_WRITE do not wait.
+    /// 7 a WAIT_REG_MEM on a label a queued fence will write counts as met; end-of-shader events
+    ///   and the compute queues' fences and read pointers are queued in order.
+    enum class PipeMode : u32 {
+        Off,
+        Inline,
+        Lockstep,
+        Draws,
+        DrawsAndDispatches,
+        Fences,
+        FewerWaits,
+        QueuedFences,
+    };
+    enum class PacketKind : u32 { Draw, DrawIndirect, Dispatch, DispatchIndirect, Special, Task };
+    struct PipeIndirect {
+        VAddr address;
+        VAddr count_address;
+        u32 offset;
+        u32 stride; ///< size of the arguments for a dispatch
+        u32 max_count;
+        u32 pad;
+    };
+    [[nodiscard]] bool UseDrawPipe() const noexcept {
+        return pipe_mode != PipeMode::Off;
+    }
+    [[nodiscard]] bool OnStageA() const;
+    void DrainDrawPipeSlow(u32 reason, u32 detail);
+    /// Writes the packet of a draw or dispatch and hands it to the second half (PipeMode)
+    void PostPacket(PacketKind kind, const Pipeline* pipeline, bool is_indexed, u32 index_offset,
+                    const PipeIndirect* indirect);
+    static void RunDrawPacket(void* context, const u8* data, u32 size);
+    void PrintPipeStats();
+    /// FilterDraw's decision without its side effects
+    [[nodiscard]] bool FilterDrawPasses() const;
+    /// The second half of a draw or dispatch: everything after the pipeline was selected
+    void DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed, VAddr arg_address,
+                            u32 offset, u32 stride, u32 max_count, VAddr count_address);
+    void DispatchRecord(const ComputePipeline* pipeline);
+    void DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address, u32 offset,
+                                u32 size);
+
+    /// Registers as the current draw sees them: the copy the running packet was applied to while
+    /// one runs (stage_regs), the command processor's otherwise
+    [[nodiscard]] const AmdGpu::Regs& DrawRegs() const noexcept;
+    [[nodiscard]] const AmdGpu::ComputeProgram& DrawCsRegs() const noexcept;
+    [[nodiscard]] const AmdGpu::CbDbExtent& CbExtent(u32 index) const noexcept;
+    [[nodiscard]] const AmdGpu::CbDbExtent& DbExtent() const noexcept;
+    static inline thread_local const AmdGpu::Regs* stage_regs = nullptr;
+    static inline thread_local const AmdGpu::ComputeProgram* stage_cs = nullptr;
+    static inline thread_local const AmdGpu::CbDbExtent* stage_cb_extent = nullptr;
+    static inline thread_local const AmdGpu::CbDbExtent* stage_db_extent = nullptr;
+
     bool IsMappedCached(VAddr addr, VAddr end);
     /// With SHADPS4_MAPPED_PAGE_TABLE_VERIFY, compare each table answer with the interval set and
     /// report how often the table returns Unknown once a minute
@@ -130,6 +257,9 @@ private:
     void UpdateMappedPageTable(VAddr addr, u64 size, bool mapped);
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    /// Layout BeginRendering gives the current draw's depth target, none without one
+    std::optional<vk::ImageLayout> DepthTargetLayout(const VideoCore::Image& image) const;
+    static bool IsReadOnlyDepthLayout(vk::ImageLayout layout);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
@@ -269,6 +399,32 @@ private:
     /// and compare the images and views
     const bool tsharp_cache_verify;
     bool tsharp_cache_on{};
+    // depth_target_sampled_layout, whether it follows SHADPS4_AB_TOGGLE and whether it
+    // is on for the draw being recorded
+    const bool depth_target_sampled_layout;
+    const bool depth_target_sampled_toggle;
+    bool depth_target_shared{};
+    static constexpr vk::AccessFlags2 SharedDepthTargetAccess =
+        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+        vk::AccessFlagBits2::eDepthStencilAttachmentRead;
+
+    /// gcn_unordered_dispatches: notes a guest draw or dispatch on the current ring
+    /// For a dispatch whose previous command on the ring was a dispatch, with
+    /// no sync packet since, returns the ring (GCN may start it before the
+    /// previous one ends), else -1
+    s8 NoteRingCommand(bool is_dispatch);
+    static constexpr u8 MaxCommandRings = 16;
+    const bool gcn_unordered_dispatches;
+    const bool gcn_unordered_toggle; ///< gcn_unordered_dispatches follows SHADPS4_AB_TOGGLE
+    u8 command_ring{};
+    std::array<bool, MaxCommandRings> ring_last_dispatch{};
+    std::array<bool, MaxCommandRings> ring_synced{};
+    // Of the dispatch being recorded: its NoteRingCommand, and whether its buffer
+    // accesses are those of a game dispatch without DMA (DMA reaches memory the
+    // barrier tracking does not see)
+    s8 unordered_ring{-1};
+    bool game_dispatch_accesses{};
+    const u64 unbounded_cap_bytes; ///< unbounded_vsharp_cap_mb in bytes, 0 = off
     u64 bind_verify_checks{};
     u64 bind_verify_mismatches{};
     u64 bind_verify_raced{};
@@ -281,6 +437,25 @@ private:
     u64 tsharp_array_binds_minute{};
     u64 tsharp_array_null_minute{};
     std::chrono::steady_clock::time_point tsharp_array_last_report{};
+
+    // Draw pipe
+    PipeMode pipe_mode{PipeMode::Off};
+    u32 pipe_verify_interval{};
+    bool pipe_synced{};                       ///< pipe_regs holds the registers of the last packet
+    std::unique_ptr<AmdGpu::Regs> pipe_regs;  ///< the second half's copy of the register file
+    std::vector<u8> inline_packet;            ///< PipeMode::Inline: the packet being run
+    u64 pipe_packets{};
+    std::array<u64, 6> pipe_packets_by_kind{};
+    u64 pipe_stats_packets{};
+    u64 pipe_stats_busy{};
+    u64 pipe_stats_tsc{};
+    std::chrono::steady_clock::time_point pipe_stats_time{};
+    // Draw preparation: the register state hash, and the blocks written since it was updated
+    RegStateHash state_hash;
+    std::bitset<AmdGpu::RegDirty::NumBlocks> hash_pending;
+    bool hash_reset_pending{};
+    std::unique_ptr<DrawPreparation> draw_prep; ///< stops its helpers before the caches go
+    std::unique_ptr<DrawPipe> draw_pipe; ///< last member: its thread stops before the rest goes
 };
 
 } // namespace Vulkan

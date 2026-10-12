@@ -70,6 +70,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/video_core/texture_cache/image_barriers.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/mapped_page_table.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/liverpool_to_vk.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/vk_access_bitmap.cpp
     ${CMAKE_SOURCE_DIR}/src/common/recursive_lock.cpp
     ${CMAKE_SOURCE_DIR}/src/core/stack_ranges.cpp
 
@@ -86,6 +87,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/common/ntapi.cpp
     ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
     ${CMAKE_SOURCE_DIR}/src/common/perf_stats.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/rdtsc.cpp
     ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
 
     # Stubs that replace dependencies
@@ -98,6 +100,7 @@ set(GCN_TEST_SOURCES
     stubs/signals_stub.cpp
 
     # Tests
+    common/test_dom_interval_list.cpp
     common/test_lru_cache.cpp
     common/test_recursive_lock.cpp
     core/test_stack_ranges.cpp
@@ -105,6 +108,7 @@ set(GCN_TEST_SOURCES
     gcn/test_component_swizzle.cpp
     gcn/test_dma_fault_bitmap.cpp
     gcn/test_graphics_workarounds.cpp
+    video_core/test_access_bitmap.cpp
     video_core/test_image_barriers.cpp
     video_core/test_mapped_page_table.cpp
     gcn/test_sharp_fetch.cpp
@@ -157,6 +161,11 @@ foreach(t ${TEST_TARGETS})
         endif()
     endif()
 endforeach()
+
+# 128-bit division (GetFixedPoint64Factor, PerfStats' TSC clock), as for the emulator
+if (WIN32 AND MSVC)
+    target_link_libraries(shadps4_gcn_test PRIVATE clang_rt.builtins-x86_64.lib)
+endif()
 
 include(GoogleTest)
 foreach(t ${TEST_TARGETS})

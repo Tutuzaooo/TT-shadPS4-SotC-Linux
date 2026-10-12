@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
+#include "common/recover_point.h"
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -40,7 +43,38 @@
 #include "common/spin_lock.h"
 #endif
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 namespace VideoCore {
+
+namespace {
+/// Use one atomic byte per page instead of the larger MSVC mutex
+/// Yield after a short spin because the holder may be in VirtualProtect
+struct PageSpinLock {
+    std::atomic<u8> held{0};
+
+    void lock() noexcept {
+        u32 spins = 0;
+        while (held.exchange(1, std::memory_order_acquire) != 0) {
+            while (held.load(std::memory_order_relaxed) != 0) {
+                if (++spins < 64) {
+#if defined(_M_X64) || defined(__x86_64__)
+                    _mm_pause();
+#endif
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        }
+    }
+
+    void unlock() noexcept {
+        held.store(0, std::memory_order_release);
+    }
+};
+} // Anonymous namespace
 
 struct PageManager::Impl {
     struct PageState {
@@ -98,7 +132,11 @@ struct PageManager::Impl {
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / NUM_REGION_PAGES;
     inline static Vulkan::Rasterizer* rasterizer;
 
-    Impl() = default;
+    Impl() : page_spin_locks{EmulatorSettings.IsPageSpinLocks()} {
+        if (page_spin_locks) {
+            LOG_WARNING(Render, "Workaround page_spin_locks enabled");
+        }
+    }
     virtual ~Impl() = default;
 
     virtual void OnMap(VAddr address, size_t size) {
@@ -113,10 +151,38 @@ struct PageManager::Impl {
     virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
 
     void EnsurePages(VAddr begin, VAddr end) {
+        end = std::min(end, VAddr{1} << ADDRESS_BITS) - 1;
         const size_t start_page = begin >> PM_PAGE_BITS;
         const size_t end_page = end >> PM_PAGE_BITS;
         cached_pages.reserve(start_page, end_page);
-        locks.reserve(start_page, end_page);
+        if (page_spin_locks) {
+            spin_locks.reserve(start_page, end_page);
+        } else {
+            locks.reserve(start_page, end_page);
+        }
+    }
+
+    /// Locks a page that has a state; its lock was reserved with it
+    void LockPage(u64 page) {
+        if (page_spin_locks) {
+            spin_locks[page].lock();
+        } else {
+            locks[page].lock();
+        }
+    }
+
+    bool HasPageLock(u64 page) {
+        return page_spin_locks ? spin_locks.find(page) != nullptr : locks.find(page) != nullptr;
+    }
+
+    void UnlockPage(u64 page) {
+        if (page_spin_locks) {
+            if (auto* lock = spin_locks.find(page)) {
+                lock->unlock();
+            }
+        } else if (auto* lock = locks.find(page)) {
+            lock->unlock();
+        }
     }
 
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
@@ -152,7 +218,7 @@ struct PageManager::Impl {
                 continue;
             }
 
-            locks[page].lock();
+            LockPage(page);
 
             const auto old_perms = state->Perms();
             if (page == page_start) {
@@ -185,9 +251,7 @@ struct PageManager::Impl {
         release_pending();
 
         for (u64 page = page_start; page != page_end; ++page) {
-            if (auto* lock = locks.find(page)) {
-                lock->unlock();
-            }
+            UnlockPage(page);
         }
     }
 
@@ -217,7 +281,7 @@ struct PageManager::Impl {
                 continue;
             }
 
-            locks[base_page + page].lock();
+            LockPage(base_page + page);
 
             const auto old_perms = state->Perms();
             if (page == page_start) {
@@ -254,9 +318,7 @@ struct PageManager::Impl {
         release_pending();
 
         for (u64 page = page_start; page != page_end; ++page) {
-            if (auto* lock = locks.find(base_page + page)) {
-                lock->unlock();
-            }
+            UnlockPage(base_page + page);
         }
     }
 
@@ -280,6 +342,17 @@ struct PageManager::Impl {
         static constexpr bool NULL_CHECK = false;
     };
     Common::MultiLevelPageTable<MutexTraits> locks;
+    struct SpinLockTraits {
+        using Entry = PageSpinLock;
+        static constexpr size_t ADDRESS_SPACE_BITS = ADDRESS_BITS;
+        static constexpr size_t L1_BITS = 16;
+        static constexpr size_t PAGE_BITS = PM_PAGE_BITS;
+        static constexpr bool NULL_CHECK = false;
+    };
+    Common::MultiLevelPageTable<SpinLockTraits> spin_locks;
+    // page_spin_locks: fixed at boot, since switching tables while pages are held would
+    // break exclusion; the pages are locked through one table or the other
+    const bool page_spin_locks;
 };
 
 #ifdef __linux__
@@ -318,6 +391,7 @@ public:
     ~UffdImpl() = default;
 
     void OnMap(VAddr address, size_t size) override {
+        PageManager::Impl::OnMap(address, size);
         uffdio_register reg;
         reg.range.start = address;
         reg.range.len = size;
@@ -399,8 +473,12 @@ public:
             // Notify rasterizer about the fault.
             const VAddr addr = msg.arg.pagefault.address;
             const auto ptid = msg.arg.pagefault.feat.ptid;
-            rasterizer->InvalidateMemory(addr, 1,
-                                         ptid == rasterizer->GetGpuCommandProcessorThreadId());
+            // Draw pipe: with userfaultfd tracking the pipe stays off (Rasterizer), so the
+            // command processor thread is the only GPU-side thread here
+            const bool is_gpu_thread = ptid == rasterizer->GetGpuCommandProcessorThreadId();
+            if (rasterizer->InvalidateMemory(addr, 1, is_gpu_thread) && !is_gpu_thread) {
+                rasterizer->ExtendWriteFault(addr);
+            }
 
             // Some calls to InvalidateMemory never reach the UFFDIO_WRITEPROTECT ioctl in
             // ::Protect, therefore we use MODE_DONTWAKE and wake the thread with UFFDIO_WAKE here
@@ -517,15 +595,26 @@ struct SignalImpl : public PageManager::Impl {
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        // Draw preparation helpers read guest memory ahead of the GPU: a fault there abandons
+        // the draw being prepared, without a readback or any change to the trackers
+        if (Common::Recover::Active()) [[unlikely]] {
+            Common::Recover::Jump();
+        }
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        // Draw pipe: the draw recording thread owns the caches while it runs draws and handles
+        // its faults inline like the command processor thread, which first waits for it to be idle
+        const bool on_draw_thread = Vulkan::DrawPipe::OnStageB();
         const auto is_gpu_thread =
+            on_draw_thread ||
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         const bool is_write = Common::IsWriteError(context);
         const bool perf = Common::PerfStats::Enabled();
         const auto start =
             perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (!is_write && is_gpu_thread && EmulatorSettings.IsSrtWalkerCleanReads() &&
-            TryCleanWalkerRead(context, addr)) {
+        // The SRT walker runs on the command processor thread only. A clean read needs neither
+        // the caches nor the GPU, so it comes before the wait for the draw recording thread
+        if (!is_write && is_gpu_thread && !on_draw_thread &&
+            EmulatorSettings.IsSrtWalkerCleanReads() && TryCleanWalkerRead(context, addr)) {
             if (perf) {
                 using namespace Common::PerfStats;
                 Add(Id::SrtCleanReads);
@@ -535,8 +624,16 @@ struct SignalImpl : public PageManager::Impl {
             }
             return true;
         }
-        bool handled = is_write ? rasterizer->InvalidateMemory(addr, 8, is_gpu_thread)
-                                : rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+        if (is_gpu_thread && !on_draw_thread) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonFault);
+        }
+        // The probe stays within the faulting page: the next one may not be mapped for the GPU (#5150)
+        const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
+        bool handled = is_write ? rasterizer->InvalidateMemory(addr, size, is_gpu_thread)
+                                : rasterizer->ReadMemory(addr, size, is_gpu_thread);
+        if (handled && is_write && !is_gpu_thread) {
+            rasterizer->ExtendWriteFault(addr);
+        }
         if (handled && EmulatorSettings.IsPreserveSplitProtection()) {
             const Common::PerfStats::ScopedTimer repair_timer{
                 Common::PerfStats::Id::FaultRepairCalls, Common::PerfStats::Id::FaultRepairNs};
@@ -636,19 +733,21 @@ struct SignalImpl : public PageManager::Impl {
         const VAddr page = addr & ~(PageManager::PM_PAGE_SIZE - 1);
         const u64 page_index = page >> PageManager::PM_PAGE_BITS;
         PageState* state = cached_pages.find(page_index);
-        auto* lock = locks.find(page_index);
-        if (!state || !lock) {
+        // A concurrent mapping can have a page state before its lock is reserved
+        if (!state || !HasPageLock(page_index)) {
             return true;
         }
         Core::MemoryPermission perms;
         {
-            std::scoped_lock lk{*lock};
+            LockPage(page_index);
             perms = state->Perms();
             if (!True(perms & (is_write ? Core::MemoryPermission::Write
                                         : Core::MemoryPermission::Read))) {
+                UnlockPage(page_index);
                 return true;
             }
             Protect(page, PageManager::PM_PAGE_SIZE, perms);
+            UnlockPage(page_index);
         }
         static std::atomic<u64> repairs{0};
         if (const u64 count = repairs.fetch_add(1) + 1; count == 1 || count % 1000 == 0) {
