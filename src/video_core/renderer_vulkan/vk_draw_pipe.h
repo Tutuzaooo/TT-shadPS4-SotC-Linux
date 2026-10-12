@@ -133,11 +133,12 @@ public:
         ReasonDispatch,
         ReasonFault, ///< a page fault of stage A
         ReasonLockstep,
+        ReasonPendingWrite, ///< stage A reads memory a queued packet writes (PINK_PIPE_EXTRA)
         NumReasons,
     };
     static constexpr std::array<const char*, NumReasons> ReasonNames = {
         "rasterizer", "opcode", "commands", "constram", "submit_end", "dispatch", "fault",
-        "lockstep",
+        "lockstep",   "pending_write",
     };
     std::array<u64, NumReasons> drains_by_reason{};
     std::array<u64, NumReasons> cycles_by_reason{};

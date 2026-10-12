@@ -1076,17 +1076,29 @@ void TextureCache::EmergencyCollect() {
 void TextureCache::GarbageCollectImages() {
     const auto now = std::chrono::steady_clock::now();
     gc_level = 0;
+    // PINK_GC_TIGHT=0 turns the levels off
+    static const bool tight_enabled = [] {
+        const char* v = std::getenv("PINK_GC_TIGHT");
+        return !v || v[0] != '0';
+    }();
+    // PINK_GC_HEADROOM=0: the fixed thresholds (from the card size) decide when the collector
+    // presses, as before 12/10/2026. With PINK_VRAM_LIMIT_MB at 4500 they sat at 1800 / 2700 MiB,
+    // far below the 5-6 GB the game uses, so the collector was always "aggressive": a texture not
+    // drawn for 160 submissions (under a second) was freed, and turning the camera back uploaded
+    // it again. Now, while the driver reports the free memory, the levels below decide: with
+    // 1 GB or more left an image stays until unused for PINK_GC_IDLE_SECONDS (20 s), under 1 GB
+    // for 3 s, and only under 640 MiB it goes after a few frames.
+    static const bool by_headroom = [] {
+        const char* v = std::getenv("PINK_GC_HEADROOM");
+        return !v || v[0] != '0';
+    }();
+    const bool use_headroom = by_headroom && tight_enabled && instance.CanReportMemoryUsage();
     if (instance.CanReportMemoryUsage()) {
         // How much the card still has for this process: what the driver allows less what is in
         // use, where the free space inside the allocator's blocks counts as available (images and
         // buffer arena memory are placed there). The fixed thresholds below know nothing of this:
         // "used" is far above "critical" all the time and the collector frees what was idle for
         // 80 frames whether the card has 2 GB left or nothing. Close to full, images go sooner.
-        // PINK_GC_TIGHT=0 turns this off.
-        static const bool tight_enabled = [] {
-            const char* v = std::getenv("PINK_GC_TIGHT");
-            return !v || v[0] != '0';
-        }();
         u64 usage = 0;
         gc_driver_budget = instance.GetDeviceMemoryBudget(&usage);
         total_used_memory = usage;
@@ -1239,15 +1251,22 @@ void TextureCache::GarbageCollectImages() {
     size_t num_deletions = 0;
     u32 visited = 0;
 
+    // The tick at the start of the second 3 s ago (level 1 with use_headroom)
+    const u64 short_idle_tick = gc_tick_at_second[(second - 3) % gc_tick_at_second.size()];
+    const auto over_critical = [&] {
+        return use_headroom ? gc_level >= 2 : total_used_memory >= critical_gc_memory;
+    };
     const auto configure = [&](bool allow_aggressive) {
-        pressured = total_used_memory >= pressure_gc_memory;
-        aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
+        pressured = use_headroom ? gc_level >= 1 : total_used_memory >= pressure_gc_memory;
+        aggresive = allow_aggressive && over_critical();
         static constexpr std::array<u64, 4> TightTicks = {~0ULL, 48, 24, 8};
         const u64 ticks_to_destroy = std::min<u64>(
             {u64{aggresive ? 160u : pressured ? 80u : 16u}, TightTicks[gc_level], gc_tick});
         below_tick = gc_tick - ticks_to_destroy;
         if (!pressured && !aggresive && gc_level == 0) {
             below_tick = std::min(below_tick, idle_tick);
+        } else if (use_headroom && gc_level == 1) {
+            below_tick = std::min(below_tick, short_idle_tick);
         }
         num_deletions = aggresive ? (small_vram ? 128 : 40) : pressured ? 20 : 10;
         if (gc_level != 0) {
@@ -1281,7 +1300,7 @@ void TextureCache::GarbageCollectImages() {
         }
         FreeImage(image_id);
         ++gc_freed_images;
-        if (total_used_memory < critical_gc_memory) {
+        if (!use_headroom && total_used_memory < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
                 aggresive = false;
@@ -1299,7 +1318,7 @@ void TextureCache::GarbageCollectImages() {
     configure(false);
     lru_cache.ForEachItemBelow(below_tick, clean_up);
 
-    if (total_used_memory >= critical_gc_memory) {
+    if (over_critical()) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         lru_cache.ForEachItemBelow(below_tick, clean_up);

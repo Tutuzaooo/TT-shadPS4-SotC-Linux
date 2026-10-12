@@ -1272,14 +1272,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     rasterizer->OnGameSync();
                 }
                 if (rasterizer) {
-                    rasterizer->RunInOrder(
+                    const bool queued = rasterizer->RunInOrder(
                         [](void* context, const u8* data) {
                             static_cast<Liverpool*>(context)->RunEventWriteEos(
                                 reinterpret_cast<const PM4CmdEventWriteEos*>(data));
                         },
-                        this, event_eos, sizeof(PM4CmdEventWriteEos), 7,
+                        this, event_eos, sizeof(PM4CmdEventWriteEos),
+                        rasterizer->PipeExtraMode(Vulkan::Rasterizer::PipeExtraEos, 7),
                         Vulkan::DrawPipe::ReasonOpcode,
                         static_cast<u32>(PM4ItOpcode::EventWriteEos));
+                    // The label it writes, for the waits on it (see EVENT_WRITE_EOP)
+                    if (queued &&
+                        event_eos->command.Value() == PM4CmdEventWriteEos::Command::SignalFence) {
+                        PrunePipeFences();
+                        pipe_fences.push_back({event_eos->Address<VAddr>(), event_eos->DataDWord(),
+                                               sizeof(u32), rasterizer->DrawPipeHead()});
+                    }
                 } else {
                     RunEventWriteEos(event_eos);
                 }
@@ -1450,10 +1458,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // Draw pipe: labels queued for the recording thread are not written yet. From
                 // mode 6 on a wait that already passes goes on without waiting for that thread
                 // From mode 7 on, the value a queued fence will write to the label decides
-                if (rasterizer && rasterizer->DrawPipeModeAtLeast(7) &&
+                // ("wait" in PINK_PIPE_EXTRA from mode 6 on), when the pending writes allow it
+                if (rasterizer &&
+                    rasterizer->DrawPipeModeAtLeast(
+                        rasterizer->PipeExtraMode(Vulkan::Rasterizer::PipeExtraWait, 7)) &&
                     wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
                     if (const auto value = PipeFenceDword(reinterpret_cast<VAddr>(wait_addr))) {
-                        if (wait_reg_mem->TestValue(*value)) {
+                        if (wait_reg_mem->TestValue(*value) && rasterizer->OrderedWaitSafe()) {
+                            rasterizer->NoteOrderedWaitSkipped();
                             break; // met once the recording thread gets there, in command order
                         }
                         rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonOpcode,
@@ -1597,7 +1609,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 std::memcpy(args.data(), data, sizeof(args));
                 static_cast<Liverpool*>(context)->AdvanceAscRead(args[0], args[1]);
             },
-            this, task_data.data(), sizeof(task_data), 7, Vulkan::DrawPipe::ReasonOpcode, 511);
+            this, task_data.data(), sizeof(task_data),
+            rasterizer->PipeExtraMode(Vulkan::Rasterizer::PipeExtraAsc, 7),
+            Vulkan::DrawPipe::ReasonOpcode, 511);
     };
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
@@ -1861,9 +1875,34 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->OnGameSync();
             }
+            // Draw pipe, "ascwait" in PINK_PIPE_EXTRA: like the graphics queue's waits, a label a
+            // queued fence will write to a passing value counts as met (in command order), and a
+            // wait that already passes does not wait for the recording thread. Both only while
+            // the pending writes are known (Rasterizer::OrderedWaitSafe)
+            bool met_in_order = false;
             if (rasterizer) {
-                rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonOpcode,
-                                          256 + static_cast<u32>(opcode));
+                bool drain = true;
+                if (rasterizer->DrawPipeModeAtLeast(
+                        rasterizer->PipeExtraMode(Vulkan::Rasterizer::PipeExtraAscWait, 8)) &&
+                    rasterizer->OrderedWaitSafe()) {
+                    std::optional<u32> queued;
+                    if (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+                        queued = PipeFenceDword(wait_reg_mem->Address<VAddr>());
+                    }
+                    if (queued) {
+                        met_in_order = wait_reg_mem->TestValue(*queued);
+                        drain = !met_in_order;
+                    } else {
+                        drain = !CpWaitPasses(wait_reg_mem, regs.reg_array);
+                    }
+                }
+                if (drain) {
+                    rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonOpcode,
+                                              256 + static_cast<u32>(opcode));
+                }
+                if (met_in_order) {
+                    rasterizer->NoteOrderedWaitSkipped();
+                }
             }
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             if (TraceSync()) {
@@ -1876,7 +1915,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         u32(wait_reg_mem->function.Value()), wait_reg_mem->ref,
                         wait_reg_mem->mask, wait_reg_mem->Test(regs.reg_array));
             }
-            while (!CpWaitPasses(wait_reg_mem, regs.reg_array)) {
+            while (!met_in_order && !CpWaitPasses(wait_reg_mem, regs.reg_array)) {
                 Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
                 YIELD_ASC(vqid);
             }
@@ -1893,15 +1932,30 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     u32 pad;
                     PM4CmdReleaseMem packet;
                 } task_data{vqid, 0, *release_mem};
-                rasterizer->RunInOrder(
+                const bool queued = rasterizer->RunInOrder(
                     [](void* context, const u8* data) {
                         u32 task_vqid;
                         std::memcpy(&task_vqid, data, sizeof(task_vqid));
                         static_cast<Liverpool*>(context)->RunReleaseMem(
                             task_vqid, reinterpret_cast<const PM4CmdReleaseMem*>(data + 8));
                     },
-                    this, &task_data, sizeof(task_data), 7, Vulkan::DrawPipe::ReasonOpcode,
+                    this, &task_data, sizeof(task_data),
+                    rasterizer->PipeExtraMode(Vulkan::Rasterizer::PipeExtraAsc, 7),
+                    Vulkan::DrawPipe::ReasonOpcode,
                     256 + static_cast<u32>(PM4ItOpcode::ReleaseMem));
+                // The label it writes, for the waits on it (see EVENT_WRITE_EOP)
+                if (queued) {
+                    const auto data_sel = release_mem->data_sel.Value();
+                    const auto addr = release_mem->Address<VAddr>();
+                    PrunePipeFences();
+                    if (data_sel == DataSelect::Data32Low) {
+                        pipe_fences.push_back({addr, release_mem->DataDWord(), sizeof(u32),
+                                               rasterizer->DrawPipeHead()});
+                    } else if (data_sel == DataSelect::Data64) {
+                        pipe_fences.push_back({addr, release_mem->DataQWord(), sizeof(u64),
+                                               rasterizer->DrawPipeHead()});
+                    }
+                }
             } else {
                 RunReleaseMem(vqid, release_mem);
             }

@@ -22,6 +22,7 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
 #include "core/memory.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/tiling.h"
@@ -644,6 +645,49 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         };
         LOG_WARNING(Render_Vulkan, "Draw pipe: mode {} ({}), register check every {} packets",
                     wanted, names[wanted], pipe_verify_interval);
+        // PINK_PIPE_EXTRA=eos,asc,wait,ascwait (or "all"): pieces of mode 7 on top of mode 6
+        if (const char* env = std::getenv("PINK_PIPE_EXTRA")) {
+            const std::string_view list{env};
+            const auto has = [&](std::string_view name) {
+                for (size_t pos = 0; pos <= list.size();) {
+                    const size_t end = std::min(list.find(',', pos), list.size());
+                    if (list.substr(pos, end - pos) == name || list.substr(pos, end - pos) == "all") {
+                        return true;
+                    }
+                    pos = end + 1;
+                }
+                return false;
+            };
+            pipe_extra = (has("eos") ? PipeExtraEos : 0u) | (has("asc") ? PipeExtraAsc : 0u) |
+                         (has("wait") ? PipeExtraWait : 0u) |
+                         (has("ascwait") ? PipeExtraAscWait : 0u);
+        }
+        if (pipe_mode < PipeMode::FewerWaits) {
+            pipe_extra = 0;
+        }
+        // Waits that a queued label meets go on without stage B only with the pending writes
+        // known. PINK_PIPE_TRACK=0 (diagnostic): they go on without, as mode 7 did at first
+        track_pending_writes = draw_pipe && (pipe_mode >= PipeMode::QueuedFences ||
+                                             (pipe_extra & (PipeExtraWait | PipeExtraAscWait)));
+        if (const char* env = std::getenv("PINK_PIPE_TRACK"); env && env[0] == '0') {
+            ordered_waits_unchecked = track_pending_writes;
+            track_pending_writes = false;
+        }
+        if (track_pending_writes) {
+            pending_granules =
+                std::make_unique<u32[]>(u64{1} << (40 - PendingGranuleBits));
+        }
+        if (pipe_extra != 0 || track_pending_writes || ordered_waits_unchecked) {
+            LOG_WARNING(Render_Vulkan,
+                        "Draw pipe extras:{}{}{}{}; pending writes {}",
+                        (pipe_extra & PipeExtraEos) ? " eos" : "",
+                        (pipe_extra & PipeExtraAsc) ? " asc" : "",
+                        (pipe_extra & PipeExtraWait) ? " wait" : "",
+                        (pipe_extra & PipeExtraAscWait) ? " ascwait" : "",
+                        track_pending_writes      ? "tracked"
+                        : ordered_waits_unchecked ? "NOT tracked (PINK_PIPE_TRACK=0)"
+                                                  : "not needed");
+        }
         // Pipeline selection on helper threads (vk_draw_prep.h): the register state hash it
         // checks against comes from the draw pipe's dirty blocks
         if (pipe_mode >= PipeMode::Draws) {
@@ -882,6 +926,9 @@ void Rasterizer::PostPacket(PacketKind kind, const Pipeline* pipeline, bool is_i
         RunDrawPacket(this, start, written);
     } else {
         draw_pipe->Commit(written);
+        if (track_pending_writes && pipeline) {
+            TrackPendingWrites(pipeline, draw_pipe->Head());
+        }
         if (pipe_mode == PipeMode::Lockstep) {
             draw_pipe->Drain(DrawPipe::ReasonLockstep);
         } else if (is_dispatch && pipe_mode < PipeMode::DrawsAndDispatches) {
@@ -912,6 +959,97 @@ bool Rasterizer::RunInOrder(OrderedTask task, void* context, const void* data, u
         PrintPipeStats();
     }
     return true;
+}
+
+void Rasterizer::TrackPendingWrites(const Pipeline* pipeline, u64 position) {
+    PrunePendingWrites();
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& desc : stage->buffers) {
+            if (!desc.is_written || desc.IsSpecial()) {
+                continue;
+            }
+            // The V# BindBuffers will see: the user data of this packet is stage A's now
+            const auto vsharp = desc.GetSharp(*stage);
+            const VAddr base = vsharp.base_address;
+            const u64 size = vsharp.GetStride() == 0
+                                 ? u64{vsharp.num_records}
+                                 : u64{vsharp.GetStride()} * u64{vsharp.num_records};
+            if (base <= 1 || size == 0) {
+                continue; // bound as null: writes nothing
+            }
+            if (size > MaxPendingWrite || base + size > (u64{1} << 40)) {
+                pending_unbounded_position = position;
+                ++pending_writes_unbounded;
+                continue;
+            }
+            const VAddr end = base + size;
+            pending_writes.push_back({base, end, position});
+            ++pending_writes_tracked;
+            for (u64 g = base >> PendingGranuleBits; g <= (end - 1) >> PendingGranuleBits; ++g) {
+                ++pending_granules[g];
+            }
+            // The SRT walkers load other pages straight from memory: send these through the
+            // clean-read path, where WaitForPendingWrites sees them (once per range)
+            if (srt_marked_ranges.size() >= 65536) {
+                srt_marked_ranges.clear(); // marking again is harmless
+            }
+            if (srt_marked_ranges.insert(base ^ (size << 40)).second) {
+                Shader::MarkSrtCleanPages(base, static_cast<u32>(size));
+            }
+        }
+    }
+}
+
+void Rasterizer::PrunePendingWrites() {
+    while (!pending_writes.empty() && draw_pipe->Reached(pending_writes.front().position)) {
+        const auto& write = pending_writes.front();
+        for (u64 g = write.start >> PendingGranuleBits; g <= (write.end - 1) >> PendingGranuleBits;
+             ++g) {
+            --pending_granules[g];
+        }
+        pending_writes.pop_front();
+    }
+}
+
+void Rasterizer::WaitForPendingWrites(VAddr addr, u64 size) {
+    if (pending_writes.empty() || size == 0 || addr + size > (u64{1} << 40)) {
+        return;
+    }
+    const VAddr end = addr + size;
+    bool maybe = false;
+    for (u64 g = addr >> PendingGranuleBits; g <= (end - 1) >> PendingGranuleBits; ++g) {
+        maybe |= pending_granules[g] != 0;
+    }
+    if (!maybe) {
+        return;
+    }
+    PrunePendingWrites();
+    bool overlaps = false;
+    for (const auto& write : pending_writes) {
+        overlaps |= write.start < end && addr < write.end;
+    }
+    if (!overlaps) {
+        return;
+    }
+    // All of it, not only up to that packet: the sync batch below belongs to stage B until it
+    // is idle. Flushed, the written range is GPU-modified in the page tracker too, so a plain load
+    // of it faults and reads it back instead of reading what was there before
+    draw_pipe->Drain(DrawPipe::ReasonPendingWrite);
+    PrunePendingWrites();
+    if (buffer_cache.IsRegionInSyncBatch(addr, size)) {
+        buffer_cache.FlushSyncBatch();
+    }
+}
+
+bool Rasterizer::OrderedWaitSafe() const {
+    if (!track_pending_writes) {
+        return ordered_waits_unchecked;
+    }
+    return EmulatorSettings.IsSrtWalkerCleanReads() &&
+           draw_pipe->Reached(pending_unbounded_position);
 }
 
 void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
@@ -1083,6 +1221,13 @@ void Rasterizer::PrintPipeStats() {
         line += fmt::format("; recording thread busy {:.1f}%; command processor waited {:.1f}%:{}",
                             100.0 * (busy - pipe_stats_busy) / cycles, 100.0 * waited / cycles,
                             reasons);
+        if (pipe_extra != 0 || track_pending_writes || ordered_waits_unchecked) {
+            line += fmt::format("; waits met in order {:.0f}/s; pending writes {:.0f}/s, "
+                                "unbounded {:.0f}/s, queued now {}",
+                                pipe_waits_skipped / seconds, pending_writes_tracked / seconds,
+                                pending_writes_unbounded / seconds, pending_writes.size());
+            pipe_waits_skipped = pending_writes_tracked = pending_writes_unbounded = 0;
+        }
         pipe_stats_busy = busy;
     }
     LOG_WARNING(Render_Vulkan, "{}", line);
@@ -3212,6 +3357,10 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
 }
 
 bool Rasterizer::ReadCleanMemory(VAddr addr, void* out, u64 size) {
+    // Memory a queued packet writes: wait for it, then the read below finds it GPU-written
+    if (track_pending_writes && OnStageA()) {
+        WaitForPendingWrites(addr, size);
+    }
     // Page by page through the clean page cache of the buffer cache: SotC serves tens of thousands of these
     // per frame, too many for the mapped-range and backing lookups with their locks
     using CleanRead = VideoCore::BufferCache::CleanRead;

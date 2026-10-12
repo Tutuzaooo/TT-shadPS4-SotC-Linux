@@ -5,7 +5,9 @@
 
 #include <array>
 #include <chrono>
+#include <deque>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 #include "common/recursive_lock.h"
@@ -180,6 +182,28 @@ public:
     /// PINK_DRAW_PIPE is at least `mode`
     [[nodiscard]] bool DrawPipeModeAtLeast(u32 mode) const noexcept {
         return static_cast<u32>(pipe_mode) >= mode;
+    }
+
+    /// PINK_PIPE_EXTRA=<list>: the pieces of pipe mode 7, each on its own on top of mode 6, so
+    /// the one behind a defect can be found (mode 7 turns the first three on together)
+    enum PipeExtra : u32 {
+        PipeExtraEos = 1,     ///< "eos": EVENT_WRITE_EOS queued in order
+        PipeExtraAsc = 2,     ///< "asc": compute queue RELEASE_MEM and read pointer in order
+        PipeExtraWait = 4,    ///< "wait": graphics WAIT_REG_MEM on a queued label counts as met
+        PipeExtraAscWait = 8, ///< "ascwait": compute WAIT_REG_MEM likewise, and no wait when it
+                              ///< already passes
+    };
+    /// The pipe mode a piece starts at: 6 with its PINK_PIPE_EXTRA flag, `mode_without` without
+    [[nodiscard]] u32 PipeExtraMode(u32 extra, u32 mode_without) const noexcept {
+        return (pipe_extra & extra) ? 6u : mode_without;
+    }
+    /// Stage A: whether a WAIT_REG_MEM that a queued label meets may go on before stage B has
+    /// run the packets queued before that label. Stage A then reads guest memory (shader resource
+    /// tables) that those packets may still write: it can do so only while it knows what they
+    /// write (pending writes, below) and none of them writes memory it cannot bound
+    [[nodiscard]] bool OrderedWaitSafe() const;
+    void NoteOrderedWaitSkipped() noexcept {
+        ++pipe_waits_skipped;
     }
 
 private:
@@ -454,6 +478,32 @@ private:
     RegStateHash state_hash;
     std::bitset<AmdGpu::RegDirty::NumBlocks> hash_pending;
     bool hash_reset_pending{};
+    // Pending writes (stage A): the guest buffers that packets queued for stage B write, kept
+    // until stage B has run them. Before stage A reads guest memory through a clean read (shader
+    // resource tables) that one of them writes, it waits for that packet: the data it would read
+    // is about to change, and only once the packet ran is the memory marked as GPU-written (read
+    // back on access). Their pages go to the clean-read path of the SRT walkers, so the walkers'
+    // plain loads do not miss them. Images written by shaders are not tracked
+    struct PendingWrite {
+        VAddr start;
+        VAddr end;
+        u64 position; ///< DrawPipe::Head() after the packet
+    };
+    static constexpr u64 PendingGranuleBits = 20;
+    static constexpr u64 MaxPendingWrite = 64_MB; ///< larger writes count as unbounded
+    void TrackPendingWrites(const Pipeline* pipeline, u64 position);
+    void PrunePendingWrites();
+    void WaitForPendingWrites(VAddr addr, u64 size);
+    u32 pipe_extra{};                        ///< PINK_PIPE_EXTRA
+    bool track_pending_writes{};             ///< tracking on (mode 7, "wait" or "ascwait")
+    bool ordered_waits_unchecked{};          ///< PINK_PIPE_TRACK=0: skip without tracking
+    std::deque<PendingWrite> pending_writes; ///< by position
+    std::unique_ptr<u32[]> pending_granules; ///< pending writes per 1 MiB of the address space
+    u64 pending_unbounded_position{};        ///< after the last packet with an unbounded write
+    std::unordered_set<u64> srt_marked_ranges; ///< ranges already sent to MarkSrtCleanPages
+    u64 pipe_waits_skipped{};
+    u64 pending_writes_tracked{};
+    u64 pending_writes_unbounded{};
     std::unique_ptr<DrawPreparation> draw_prep; ///< stops its helpers before the caches go
     std::unique_ptr<DrawPipe> draw_pipe; ///< last member: its thread stops before the rest goes
 };
