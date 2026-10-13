@@ -1086,8 +1086,8 @@ void TextureCache::GarbageCollectImages() {
     // far below the 5-6 GB the game uses, so the collector was always "aggressive": a texture not
     // drawn for 160 submissions (under a second) was freed, and turning the camera back uploaded
     // it again. Now, while the driver reports the free memory, the levels below decide: with
-    // 1 GB or more left an image stays until unused for PINK_GC_IDLE_SECONDS (20 s), under 1 GB
-    // for 3 s, and only under 640 MiB it goes after a few frames.
+    // 1.5 GB or more left an image stays until unused for PINK_GC_IDLE_SECONDS (8 s), under
+    // 1.5 GB for 3 s, and under 1 GB it goes after a few frames.
     static const bool by_headroom = [] {
         const char* v = std::getenv("PINK_GC_HEADROOM");
         return !v || v[0] != '0';
@@ -1115,7 +1115,15 @@ void TextureCache::GarbageCollectImages() {
         const u64 in_use = usage - std::min(usage, allocator_free);
         gc_headroom = gc_driver_budget > in_use ? gc_driver_budget - in_use : 0;
         if (tight_enabled) {
-            gc_level = gc_headroom < 384_MB ? 3 : gc_headroom < 640_MB ? 2 : gc_headroom < 1_GB;
+            // With the headroom deciding (use_headroom) the levels start 512 MiB higher: images
+            // then stay longer and the card runs fuller, and the buffer arenas, which never give
+            // memory back, need room to grow (13/10/2026: out of memory with 2.3 GB of arenas
+            // when the levels sat at 384 / 640 / 1024 MiB)
+            gc_level = use_headroom
+                           ? (gc_headroom < 640_MB ? 3 : gc_headroom < 1_GB ? 2
+                                                     : gc_headroom < 1536_MB ? 1 : 0)
+                           : (gc_headroom < 384_MB ? 3 : gc_headroom < 640_MB ? 2
+                                                     : gc_headroom < 1_GB ? 1 : 0);
         }
         if (gc_level >= 2 && now - gc_tight_log_time >= std::chrono::seconds{30}) {
             gc_tight_log_time = now;
@@ -1137,11 +1145,11 @@ void TextureCache::GarbageCollectImages() {
         gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
     }
     // PINK_GC_IDLE_SECONDS=<n>: below the pressure mark an image goes only once unused for n seconds
-    // (default 20, at most 63) instead of 16 ticks, a few frames, which evicted textures briefly
+    // (default 8, at most 63) instead of 16 ticks, a few frames, which evicted textures briefly
     // off screen and uploaded them again. 0 restores the 16 ticks.
     static const u64 idle_seconds = [] {
         const char* v = std::getenv("PINK_GC_IDLE_SECONDS");
-        return std::min<u64>(v ? std::strtoull(v, nullptr, 10) : 20, 63);
+        return std::min<u64>(v ? std::strtoull(v, nullptr, 10) : 8, 63);
     }();
     // PINK_GC_SKIP_KEPT=0 restores the collector that let images it cannot free use up its deletions
     static const bool skip_kept = [] {
