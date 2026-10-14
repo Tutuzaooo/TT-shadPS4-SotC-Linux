@@ -178,6 +178,13 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
     }
 
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
+        // Without DMA, EmitReadConst uses flat buffer dword 0 for unflattened reads, including loop-indexed reads, which breaks the shader
+        if (True(info.readconst_types & Info::ReadConstType::Dynamic)) {
+            LOG_ERROR(Render_Recompiler,
+                      "Shader {:#x} reads SRT memory the walker could not flatten, which needs "
+                      "direct_memory_access_enabled",
+                      info.pgm_hash);
+        }
         info.uses_dma = false;
         info.readconst_types = Info::ReadConstType::None;
     }
