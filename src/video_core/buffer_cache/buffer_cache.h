@@ -131,6 +131,10 @@ public:
         return gpu_modified_ranges.Intersects(addr, size);
     }
 
+    /// Check for GPU-written bytes elsewhere on the pages of [addr, addr + size); page tracking would force a readback before a CPU write;
+    /// command processor thread only
+    [[nodiscard]] bool HasGpuWritesAround(VAddr addr, u64 size) const;
+
     enum class CleanRead { Served, GpuWritten, Miss };
     /// Clean reads (Rasterizer::ReadCleanMemory) of [addr, addr + size), within one 4 KiB page, from a cache
     /// of pages that holds their backing pointer and the hull of their GPU-written bytes. On Miss the caller

@@ -116,6 +116,10 @@ public:
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
+    /// Check whether an image overlaps [address, address + size); hold the lock because guest write faults may change the same images'
+    /// Picked flags
+    [[nodiscard]] bool HasImageInRegion(VAddr address, size_t size);
+
     /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 

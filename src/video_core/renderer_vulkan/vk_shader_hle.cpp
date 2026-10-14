@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+
+#include "core/memory.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -101,6 +104,86 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     }
 
     return true;
+}
+
+ReplicateFillPlan PlanReplicateFill(const Shader::Info& info,
+                                    const AmdGpu::ComputeProgram& cs_program,
+                                    Rasterizer& rasterizer, VAddr& dst, std::vector<u32>& data) {
+    // Based on AjncSystem's ShadowOfTheColossus-PC ExecuteReplicateShaderHLE; uses control (n, m), source and destination buffers with
+    // 32-bit elements
+    constexpr auto Refused = ReplicateFillPlan::Refused;
+    std::array<const Shader::BufferResource*, 3> buffers{};
+    u32 num_buffers = 0;
+    for (const auto& desc : info.buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        if (num_buffers == buffers.size()) {
+            return Refused;
+        }
+        buffers[num_buffers++] = &desc;
+    }
+    if (num_buffers != 3 || buffers[0]->is_written || buffers[1]->is_written ||
+        !buffers[2]->is_written) {
+        return Refused;
+    }
+    // Use one row of 64-thread groups; any zero dimension means no work
+    if (cs_program.dim_y > 1 || cs_program.dim_z > 1 || cs_program.num_thread_x.full != 64 ||
+        cs_program.num_thread_y.full != 1 || cs_program.num_thread_z.full != 1 ||
+        cs_program.start_x != 0) {
+        return Refused;
+    }
+    const Shader::UdView ud{info};
+    const auto ctl = buffers[0]->GetSharp(ud);
+    const auto src = buffers[1]->GetSharp(ud);
+    const auto out = buffers[2]->GetSharp(ud);
+    const u32 src_stride = src.GetStride() ? src.GetStride() : 4;
+    const u32 dst_stride = out.GetStride() ? out.GetStride() : 4;
+    if (src_stride != 4 || dst_stride != 4 || ctl.GetSize() < 8 || ctl.base_address <= 1 ||
+        src.base_address <= 1 || out.base_address <= 1) {
+        return Refused;
+    }
+    dst = out.base_address;
+    // IsComputeMetaClear treats a metadata destination as a clear, including fills with no elements
+    if (rasterizer.GetTextureCache().IsMeta(dst)) {
+        return Refused;
+    }
+    auto& buffer_cache = rasterizer.GetBufferCache();
+    auto* memory = Core::Memory::Instance();
+    // BindBuffers binds buffers outside GPU mappings as null, making GPU reads return zero
+    if (!rasterizer.IsMapped(ctl.base_address, 8) ||
+        buffer_cache.IsRegionGpuModified(ctl.base_address, 8)) {
+        return Refused;
+    }
+    std::array<u32, 2> control{};
+    if (!memory->TryReadBacking(ctl.base_address, control.data(), sizeof(control))) {
+        return Refused;
+    }
+    const auto size = SizeReplicateFill({
+        .ctl = ctl.base_address,
+        .src = src.base_address,
+        .dst = dst,
+        .src_size = src.GetSize(),
+        .dst_size = out.GetSize(),
+        .n = control[0],
+        .m = control[1],
+        .limit = cs_program.user_data[6],
+        .threads = u64{cs_program.dim_x} * cs_program.dim_y * cs_program.dim_z * 64,
+    });
+    if (size.plan != ReplicateFillPlan::Fill) {
+        return size.plan;
+    }
+    const u64 src_bytes = size.src_count * sizeof(u32);
+    if (!rasterizer.IsMapped(src.base_address, src_bytes) ||
+        buffer_cache.IsRegionGpuModified(src.base_address, src_bytes)) {
+        return Refused;
+    }
+    data.resize(size.count);
+    if (!memory->TryReadBacking(src.base_address, data.data(), src_bytes)) {
+        return Refused;
+    }
+    RepeatReplicateFill(data, size.src_count);
+    return ReplicateFillPlan::Fill;
 }
 
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,

@@ -54,6 +54,7 @@ struct Header {
     u8 game_dispatch_accesses; ///< A guest dispatch without DMA for gcn_unordered_dispatches
     u8 depth_copy;             ///< DepthStencilCopy filter result
     u8 stencil_copy;
+    u8 fill_hle; ///< Stage A selected this dispatch as a CPU fill candidate
     u32 index_offset;
     const Pipeline* pipeline;
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent;

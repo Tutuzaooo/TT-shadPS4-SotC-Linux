@@ -532,7 +532,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       pipe_regs{std::make_unique<AmdGpu::Regs>()}, pipe_verify_interval{[] {
           const char* value = std::getenv("SHADPS4_PIPE_VERIFY");
           return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
-      }()} {
+      }()},
+      replicate_fill_hle{EmulatorSettings.IsReplicateFillHle()},
+      fill_hle_toggle{Common::PerfStats::AbToggleFollows("replicate_fill_hle")},
+      fill_hle_verify{replicate_fill_hle && std::getenv("SHADPS4_FILL_HLE_VERIFY") != nullptr} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -607,6 +610,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (rs_memo) {
         LOG_WARNING(Render_Vulkan, "Workaround render_state_memo enabled{}",
                     rs_memo_verify ? " (verify)" : "");
+    }
+    if (replicate_fill_hle) {
+        LOG_WARNING(Render_Vulkan, "Workaround replicate_fill_hle enabled{}",
+                    fill_hle_verify ? " (verify)" : "");
     }
     if (pipe_verify_interval != 0) {
         LOG_WARNING(Render_Vulkan, "Draw packet verify every {} packets", pipe_verify_interval);
@@ -735,6 +742,8 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     packet.num_stages = static_cast<u8>(num_stages);
     packet.num_blocks = static_cast<u16>(num_blocks);
     packet.unordered_ring = -1;
+    packet.fill_hle = fill_hle_next;
+    fill_hle_next = false;
     packet.pipeline = pipeline;
     packet.cb_extent = liverpool->last_cb_extent;
     packet.db_extent = liverpool->last_db_extent;
@@ -838,7 +847,9 @@ void Rasterizer::RunPacket() {
         break;
     case DrawPacket::Kind::Dispatch:
         game_dispatch_accesses = packet.game_dispatch_accesses;
+        fill_hle_packet = packet.fill_hle;
         DispatchRecord(static_cast<const ComputePipeline*>(packet.pipeline));
+        fill_hle_packet = false;
         break;
     case DrawPacket::Kind::DispatchIndirect:
         game_dispatch_accesses = packet.game_dispatch_accesses;
@@ -1385,6 +1396,9 @@ void Rasterizer::DispatchPrepare(bool indirect, VAddr address, u32 size, s8 ring
         ProbeStaleCbuf(cs, memory, buffer_cache);
     }
 
+    // Choose replicate_fill_hle while building the packet so both stages use the same A/B decision
+    fill_hle_next = replicate_fill_hle && !indirect && cs.pgm_hash == ReplicateFillHash &&
+                    Common::PerfStats::AbToggleOn(fill_hle_toggle);
     auto& packet = BuildPacket(
         indirect ? DrawPacket::Kind::DispatchIndirect : DrawPacket::Kind::Dispatch, pipeline, true);
     packet.unordered_ring = game_accesses ? ring : s8{-1};
@@ -1399,8 +1413,24 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
         return;
     }
+    // Rejected fills and verification fills use the GPU path below
+    VAddr fill_verify_dst = 0;
+    const bool fill_on_gpu = fill_hle_packet;
+    if (fill_hle_packet && RunReplicateFill(cs, cs_program, fill_verify_dst)) {
+        return;
+    }
+    const auto flush_fill = [&] {
+        if (!fill_on_gpu) {
+            return;
+        }
+        buffer_cache.FlushSyncBatch();
+        if (fill_verify_dst != 0) {
+            VerifyReplicateFill(fill_verify_dst);
+        }
+    };
 
     if (!BindResources(pipeline)) {
+        flush_fill();
         return;
     }
 
@@ -1431,6 +1461,89 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     OnGpuCommandRecorded();
     ResetBindings(true);
+    flush_fill();
+}
+
+bool Rasterizer::RunReplicateFill(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_program,
+                                  VAddr& verify_dst) {
+    // Preserve command order: upload old bytes for earlier commands before writing, then let later SRT walks read the new bytes
+    using Common::PerfStats::Id;
+    VAddr dst = 0;
+    const auto plan = PlanReplicateFill(cs, cs_program, *this, dst, fill_data);
+    if (plan == ReplicateFillPlan::Empty) {
+        Common::PerfStats::Add(Id::FillHleRuns);
+        return !fill_hle_verify;
+    }
+    const u64 bytes = fill_data.size() * sizeof(u32);
+    // A CPU write may read back neighboring GPU data and modify stacks or overlapping images; keep those cases on the GPU
+    if (plan == ReplicateFillPlan::Refused || !IsMapped(dst, bytes) ||
+        memory->OverlapsStackRange(dst, bytes) || buffer_cache.HasGpuWritesAround(dst, bytes) ||
+        texture_cache.HasImageInRegion(dst, bytes)) {
+        Common::PerfStats::Add(Id::FillHleRefused);
+        return false;
+    }
+    if (fill_hle_verify) {
+        verify_dst = dst;
+        return false;
+    }
+    // Upload the old bytes before changing a range used by bindings since the last flush
+    if (buffer_cache.IsRegionInSyncBatch(dst, bytes)) {
+        buffer_cache.FlushSyncBatch();
+        Common::PerfStats::Add(Id::FillHleFlushes);
+    }
+    // Handle this like a write fault: read back GPU data and mark the pages CPU-modified
+    if (Common::PerfStats::Enabled() && buffer_cache.IsRegionGpuModified(dst, bytes)) {
+        Common::PerfStats::Add(Id::FillHleReadbacks);
+    }
+    InvalidateMemory(dst, bytes, true);
+    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::FillCpu, dst, bytes,
+                                      fill_data.data(), ReplicateFillHash);
+    if (!memory->TryWriteBacking(std::bit_cast<void*>(dst), fill_data.data(), bytes)) {
+        // No bytes were written, so use the GPU path; InvalidateMemory only changed the page marks
+        Common::PerfStats::Add(Id::FillHleRefused);
+        return false;
+    }
+    Common::PerfStats::Add(Id::FillHleRuns);
+    Common::PerfStats::Add(Id::FillHleBytes, bytes);
+    return true;
+}
+
+void Rasterizer::VerifyReplicateFill(VAddr dst) {
+    // Verification calls Finish for each fill; the preceding flush marks the GPU write for readback
+    using Common::PerfStats::Id;
+    const u64 bytes = fill_data.size() * sizeof(u32);
+    buffer_cache.ReadMemory(dst, bytes, false, true);
+    fill_verify_gpu.resize(fill_data.size());
+    if (!memory->TryReadBacking(dst, fill_verify_gpu.data(), bytes)) {
+        return;
+    }
+    ++fill_verify_checks;
+    Common::PerfStats::Add(Id::FillHleVerifyChecks);
+    if (std::memcmp(fill_verify_gpu.data(), fill_data.data(), bytes) != 0) {
+        ++fill_verify_mismatches;
+        Common::PerfStats::Add(Id::FillHleVerifyMismatches);
+        if (fill_verify_mismatches <= 32) {
+            u64 first = 0;
+            while (fill_verify_gpu[first] == fill_data[first]) {
+                ++first;
+            }
+            u64 differing = 0;
+            for (u64 i = 0; i < fill_data.size(); ++i) {
+                differing += fill_verify_gpu[i] != fill_data[i];
+            }
+            LOG_ERROR(Render_Vulkan,
+                      "replicate_fill_hle verify: fill at {:#x} ({} elements) differs from the GPU "
+                      "at element {} (gpu {:#x}, cpu {:#x}), {} elements differ",
+                      dst, fill_data.size(), first, fill_verify_gpu[first], fill_data[first],
+                      differing);
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (fill_verify_checks == 1 || now - fill_verify_last_report >= std::chrono::minutes{1}) {
+        LOG_WARNING(Render_Vulkan, "replicate_fill_hle verify: {} fills checked, {} mismatches",
+                    fill_verify_checks, fill_verify_mismatches);
+        fill_verify_last_report = now;
+    }
 }
 
 void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address, u32 size) {

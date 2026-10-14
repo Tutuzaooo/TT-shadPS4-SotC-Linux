@@ -157,6 +157,13 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::TargetSkipMismatches, "target_skip_mismatches", Unit::Count},
     {Id::UnboundedClamps, "unbounded_clamps", Unit::Count},
     {Id::UnboundedClampBytes, "unbounded_clamp_kb", Unit::Kb},
+    {Id::FillHleRuns, "fill_hle", Unit::Count},
+    {Id::FillHleBytes, "fill_hle_kb", Unit::Kb},
+    {Id::FillHleRefused, "fill_hle_refused", Unit::Count},
+    {Id::FillHleFlushes, "fill_hle_flushes", Unit::Count},
+    {Id::FillHleReadbacks, "fill_hle_readbacks", Unit::Count},
+    {Id::FillHleVerifyChecks, "fill_hle_verify", Unit::Count},
+    {Id::FillHleVerifyMismatches, "fill_hle_mismatches", Unit::Count},
 }};
 
 constexpr bool FieldsMatchIds() {

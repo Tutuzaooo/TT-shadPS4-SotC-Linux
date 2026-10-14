@@ -213,6 +213,15 @@ enum class Id : u32 {
     // cap, and the bytes cut off
     UnboundedClamps,
     UnboundedClampBytes,
+    // Count CPU fills and bytes, GPU fallbacks, flushes for overlapping bindings and readbacks before CPU writes; SHADPS4_FILL_HLE_VERIFY
+    // also counts output comparisons and mismatches
+    FillHleRuns,
+    FillHleBytes,
+    FillHleRefused,
+    FillHleFlushes,
+    FillHleReadbacks,
+    FillHleVerifyChecks,
+    FillHleVerifyMismatches,
     Count,
 };
 

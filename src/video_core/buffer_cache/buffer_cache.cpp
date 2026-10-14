@@ -923,6 +923,15 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return false;
 }
 
+bool BufferCache::HasGpuWritesAround(VAddr addr, u64 size) const {
+    const VAddr lo = Common::AlignDown(addr, BYTES_PER_PAGE);
+    const VAddr hi = Common::AlignUp(addr + size, BYTES_PER_PAGE);
+    bool around = false;
+    gpu_modified_ranges.ForEachInRange(
+        lo, hi - lo, [&](VAddr start, VAddr end) { around |= start < addr || end > addr + size; });
+    return around;
+}
+
 void BufferCache::SynchronizeDmaBuffers() {
     fault_process_pending = true;
     // Stack pages are never write-watched (cpu_authoritative_stacks), so they stay CPU-modified and a sweep

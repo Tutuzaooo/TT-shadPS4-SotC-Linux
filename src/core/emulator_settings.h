@@ -612,6 +612,9 @@ struct GPUSettings {
     // Reuse targets and render state while CB/DB registers, target-page images and metadata stay the same; each draw still updates targets
     // and transitions layouts
     Setting<bool> render_state_memo{false};
+    // Run SotC's table fill shader cs 0x50784801 on the CPU when recording, keeping tables available to the SRT walker; require CPU-side
+    // control data and source, and a fill of at most 64 KiB; SHADPS4_FILL_HLE_VERIFY=1 uses the GPU and compares its output
+    Setting<bool> replicate_fill_hle{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -711,6 +714,7 @@ struct GPUSettings {
                                        &GPUSettings::image_pool_texture_max_kb),
             make_override<GPUSettings>("arena_evict_idle_s", &GPUSettings::arena_evict_idle_s),
             make_override<GPUSettings>("render_state_memo", &GPUSettings::render_state_memo),
+            make_override<GPUSettings>("replicate_fill_hle", &GPUSettings::replicate_fill_hle),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -735,8 +739,8 @@ struct GPUSettings {
         readback_hot_regions, depth_target_sampled_layout, gcn_unordered_dispatches,                \
         access_bitmap_tracking, page_spin_locks, range_fast_paths, unbounded_vsharp_cap_mb,         \
         texture_gc_full_scan, texture_gc_trigger_mb, image_pool_texture_max_kb,                     \
-        arena_evict_idle_s, render_state_memo, dlss_nr_enabled, dlss_nr_style, dlss_nr_intensity,   \
-        dlss_nr_ui_correction))
+        arena_evict_idle_s, render_state_memo, replicate_fill_hle, dlss_nr_enabled, dlss_nr_style,  \
+        dlss_nr_intensity, dlss_nr_ui_correction))
 template <typename BasicJsonType,
           nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
 void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
@@ -1090,6 +1094,7 @@ public:
     SETTING_FORWARD(m_gpu, ImagePoolTextureMaxKb, image_pool_texture_max_kb)
     SETTING_FORWARD(m_gpu, ArenaEvictIdleS, arena_evict_idle_s)
     SETTING_FORWARD_BOOL(m_gpu, RenderStateMemo, render_state_memo)
+    SETTING_FORWARD_BOOL(m_gpu, ReplicateFillHle, replicate_fill_hle)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

@@ -112,6 +112,7 @@ set(GCN_TEST_SOURCES
     video_core/test_access_bitmap.cpp
     video_core/test_image_barriers.cpp
     video_core/test_mapped_page_table.cpp
+    video_core/test_replicate_fill.cpp
     gcn/test_sharp_fetch.cpp
     gcn/test_spirv_conformance.cpp
 )

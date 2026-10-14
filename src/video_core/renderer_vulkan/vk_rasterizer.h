@@ -186,6 +186,12 @@ private:
                             u32 stride, u32 max_count, VAddr count_address);
     void DispatchRecord(const ComputePipeline* pipeline);
     void DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address, u32 size);
+    /// Plan and write a stage B CPU fill; return false to use the GPU, with verify_dst identifying where verification should compare
+    /// fill_data
+    bool RunReplicateFill(const Shader::Info& cs, const AmdGpu::ComputeProgram& cs_program,
+                          VAddr& verify_dst);
+    /// SHADPS4_FILL_HLE_VERIFY reads back dst after the GPU fill and compares it with fill_data
+    void VerifyReplicateFill(VAddr dst);
     const AmdGpu::Regs& Regs() const;
     AmdGpu::CbDbExtent CbExtent(u32 index) const;
     AmdGpu::CbDbExtent DbExtent() const;
@@ -444,6 +450,18 @@ private:
     u64 pipe_verify_checks{};
     u64 pipe_verify_mismatches{};
     std::chrono::steady_clock::time_point pipe_verify_last_report{};
+    // Store the replicate_fill_hle setting, A/B participation and verification mode; stage A selects candidates and stage B plans and runs
+    // them; GPU fallbacks flush immediately so later walks see their write marks
+    const bool replicate_fill_hle;
+    const bool fill_hle_toggle;
+    const bool fill_hle_verify;
+    bool fill_hle_next{};
+    bool fill_hle_packet{};
+    std::vector<u32> fill_data;
+    std::vector<u32> fill_verify_gpu;
+    u64 fill_verify_checks{};
+    u64 fill_verify_mismatches{};
+    std::chrono::steady_clock::time_point fill_verify_last_report{};
 };
 
 } // namespace Vulkan
