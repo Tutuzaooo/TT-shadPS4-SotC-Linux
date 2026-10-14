@@ -26,6 +26,13 @@ void Info::RefreshSharpTables() {
             // Null T#s: the array binds null images, like the unflattened sharp did
             std::memset(dst, 0, size);
         }
+        if (table.count_loc != 0) {
+            // Entries past n are not T#s; in SotC's vs 0x9d6f9bf4 they look like a T# over the constant ring and caused a GPU hang
+            const s32 count = static_cast<s32>(flattened_ud_buf[table.count_loc]);
+            const u32 live = count <= 0 ? 0u : std::min<u32>(count, table.num_elements);
+            std::memset(dst + live * table.stride_dw, 0,
+                        u64{table.num_elements - live} * table.stride_dw * sizeof(u32));
+        }
     }
 }
 

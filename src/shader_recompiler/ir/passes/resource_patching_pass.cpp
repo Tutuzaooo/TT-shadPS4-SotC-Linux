@@ -297,7 +297,58 @@ struct SharpTableMatch {
     IR::Value element;
     u32 stride_dw;
     u32 first_dw;
+    SharpLocation count_loc;
 };
+
+/// Return the flat location of n for a flattened loop bound in `for (i = 0; i < n; ++i)`, or 0 if no bound is found
+SharpLocation FindLoopCountLocation(const IR::Value& element) {
+    const IR::Inst* phi = element.TryInst();
+    if (!phi || phi->GetOpcode() != IR::Opcode::Phi || phi->NumArgs() != 2) {
+        return 0;
+    }
+    bool starts_at_zero = false;
+    bool steps_by_one = false;
+    for (size_t i = 0; i < phi->NumArgs(); ++i) {
+        const IR::Value arg = phi->Arg(i);
+        if (arg.IsImmediate()) {
+            starts_at_zero |= arg.U32() == 0;
+            continue;
+        }
+        const IR::Inst* step = arg.Inst();
+        if (step->GetOpcode() != IR::Opcode::IAdd32) {
+            continue;
+        }
+        for (u32 operand = 0; operand < 2; ++operand) {
+            const IR::Value other = step->Arg(1 - operand);
+            steps_by_one |= step->Arg(operand) == element && other.IsImmediate() && other.U32() == 1;
+        }
+    }
+    if (!starts_at_zero || !steps_by_one) {
+        return 0;
+    }
+    for (const IR::Use& use : phi->Uses()) {
+        IR::Value bound;
+        switch (use.user->GetOpcode()) {
+        case IR::Opcode::SLessThan32:
+        case IR::Opcode::ULessThan32:
+            bound = use.operand == 0 ? use.user->Arg(1) : IR::Value{};
+            break;
+        case IR::Opcode::SGreaterThan32:
+        case IR::Opcode::UGreaterThan32:
+            bound = use.operand == 1 ? use.user->Arg(0) : IR::Value{};
+            break;
+        default:
+            break;
+        }
+        if (bound.IsEmpty()) {
+            continue;
+        }
+        if (const auto location = FlatLocation(bound)) {
+            return *location;
+        }
+    }
+    return 0;
+}
 
 /// Per-game dynamic_tsharp_array_size: recognizes a sharp whose dwords are all ReadConst(ptr, element *
 /// stride + first + k), ptr being flattened (SotC cs 0xfb974c0e reads the reflection probe cubemap at P +
@@ -323,7 +374,7 @@ std::optional<SharpTableMatch> MatchSharpTable(const SharpReference& sharp) {
         }
         if (!match) {
             match = SharpTableMatch{*ptr_lo, *ptr_hi, offset.element, offset.scale,
-                                    offset.offset - i};
+                                    offset.offset - i, FindLoopCountLocation(offset.element)};
         } else if (*ptr_lo != match->ptr_lo || *ptr_hi != match->ptr_hi ||
                    offset.element != match->element || offset.scale != match->stride_dw ||
                    offset.offset != match->first_dw + i) {
@@ -340,6 +391,7 @@ std::optional<SharpFetch<AmdGpu::Image>> AddSharpTable(Info& info, const SharpTa
     auto it = std::ranges::find_if(info.sharp_tables, [&](const SharpTable& table) {
         return table.ptr_lo == match.ptr_lo && table.ptr_hi == match.ptr_hi &&
                table.stride_dw == match.stride_dw && table.num_elements == num_elements &&
+               table.count_loc == match.count_loc &&
                match.first_dw >= table.offset_dw &&
                match.first_dw + num_dwords <= table.offset_dw + table.stride_dw;
     });
@@ -356,6 +408,7 @@ std::optional<SharpFetch<AmdGpu::Image>> AddSharpTable(Info& info, const SharpTa
             .num_elements = static_cast<u16>(num_elements),
             .offset_dw = match.first_dw,
             .stride_dw = match.stride_dw,
+            .count_loc = match.count_loc,
         });
         info.srt_info.flattened_bufsize_dw += num_elements * match.stride_dw;
         // Make the elements visible to the rest of the compilation (image type, cube fixup)
@@ -370,9 +423,9 @@ std::optional<SharpFetch<AmdGpu::Image>> AddSharpTable(Info& info, const SharpTa
     }
     LOG_WARNING(Render_Recompiler,
                 "Workaround dynamic_tsharp_array_size: shader {:#x} indexes {} T#s at "
-                "flat[{}:{}] + {:#x}, stride {} bytes",
+                "flat[{}:{}] + {:#x}, stride {} bytes, loop count at flat[{}]",
                 info.pgm_hash, num_elements, match.ptr_lo, match.ptr_hi, match.first_dw * 4,
-                match.stride_dw * 4);
+                match.stride_dw * 4, match.count_loc);
     return fetch;
 }
 
@@ -426,9 +479,9 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     // need fallback (TODO is this 100% true?)
     const bool needs_mip_storage_fallback =
         inst_info.has_lod && is_written && !profile.supports_image_load_store_lod;
-    // Per-game: a sampled T# read at a dynamic offset becomes a descriptor array. Compute only: SotC's vs
-    // 0x9d6f9bf4 matches too (shadow map tables) and hung the GPU with it
-    const u32 array_size = info.hw_stage == HwStage::Compute ? DynamicTsharpArraySize() : 0;
+    // Use a descriptor array for dynamic T# reads when enabled for the game; SotC uses these for probe cubemaps in cs 0xfb974c0e and
+    // projector shadows in vs 0x9d6f9bf4
+    const u32 array_size = DynamicTsharpArraySize();
     auto table =
         array_size != 0 && !is_written ? MatchSharpTable(resource.sharps[0]) : std::nullopt;
     if (table && NumArrayDescriptors(info) + array_size + 1 > NUM_IMAGE_ARRAY_DESCRIPTORS) {
