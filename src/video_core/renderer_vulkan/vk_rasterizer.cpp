@@ -1728,7 +1728,7 @@ bool Rasterizer::RunReplicateFill(const Shader::Info& cs, const AmdGpu::ComputeP
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::FillCpu, dst, bytes,
                                       fill_data.data(), ReplicateFillHash);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(dst), fill_data.data(), bytes)) {
-        // No bytes were written, so use the GPU path; InvalidateMemory only changed the page marks
+        // Use the GPU for missing or partial writes; it rewrites the whole fill, while InvalidateMemory only changed the page marks
         Common::PerfStats::Add(Id::FillHleRefused);
         return false;
     }
