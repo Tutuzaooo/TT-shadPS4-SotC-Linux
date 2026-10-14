@@ -109,6 +109,10 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
+    /// Report whether this thread's last FindImage reused an exact match without resolving overlaps; that result stays valid while the
+    /// range's page images stay the same
+    [[nodiscard]] static bool LastFindExact() noexcept;
+
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
@@ -215,6 +219,7 @@ public:
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
             it.value().clear_mask = u32(-1);
+            meta_generation.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
         return false;
@@ -226,6 +231,7 @@ public:
         if (it != surface_metas.end()) {
             if (is_clear) {
                 it.value().clear_mask |= 1u << slice;
+                meta_generation.fetch_add(1, std::memory_order_relaxed);
             } else {
                 it.value().clear_mask &= ~(1u << slice);
             }
@@ -320,11 +326,21 @@ public:
     /// image recently used
     void TouchReusedImage(ImageId image_id);
 
+    /// Track metadata registrations, removals and cleared slices; IsMetaCleared cannot become true until this counter changes
+    [[nodiscard]] u64 MetaGeneration() const noexcept {
+        return meta_generation.load(std::memory_order_relaxed);
+    }
+
+    /// Apply target updates without repeating the view lookup or metadata registration; the image must already have desc's metadata
+    /// addresses
+    void TouchReusedTarget(ImageId image_id, const ImageDesc& desc);
+
 private:
     static constexpr u64 NumStampPages = 1ULL << (Traits::ADDRESS_SPACE_BITS - Traits::PAGE_BITS);
     void StampPages(VAddr addr, u64 size, u64 generation);
 
     std::atomic<u64> image_set_generation{0};
+    std::atomic<u64> meta_generation{0};
     std::unique_ptr<std::atomic<u64>[]> page_stamps;
 
     /// Stamp affected 1 MiB pages before guest writes or unmaps change any image

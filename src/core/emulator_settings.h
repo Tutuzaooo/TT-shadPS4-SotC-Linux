@@ -609,6 +609,9 @@ struct GPUSettings {
     // Keep GPU-written data and allocations made by DMA faults
     // Upload the bytes again when an evicted range is reused
     Setting<u32> arena_evict_idle_s{0};
+    // Reuse targets and render state while CB/DB registers, target-page images and metadata stay the same; each draw still updates targets
+    // and transitions layouts
+    Setting<bool> render_state_memo{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -707,6 +710,7 @@ struct GPUSettings {
             make_override<GPUSettings>("image_pool_texture_max_kb",
                                        &GPUSettings::image_pool_texture_max_kb),
             make_override<GPUSettings>("arena_evict_idle_s", &GPUSettings::arena_evict_idle_s),
+            make_override<GPUSettings>("render_state_memo", &GPUSettings::render_state_memo),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -731,7 +735,7 @@ struct GPUSettings {
         readback_hot_regions, depth_target_sampled_layout, gcn_unordered_dispatches,                \
         access_bitmap_tracking, page_spin_locks, range_fast_paths, unbounded_vsharp_cap_mb,         \
         texture_gc_full_scan, texture_gc_trigger_mb, image_pool_texture_max_kb,                     \
-        arena_evict_idle_s, dlss_nr_enabled, dlss_nr_style, dlss_nr_intensity,                      \
+        arena_evict_idle_s, render_state_memo, dlss_nr_enabled, dlss_nr_style, dlss_nr_intensity,   \
         dlss_nr_ui_correction))
 template <typename BasicJsonType,
           nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
@@ -1085,6 +1089,7 @@ public:
     SETTING_FORWARD(m_gpu, TextureGcTriggerMb, texture_gc_trigger_mb)
     SETTING_FORWARD(m_gpu, ImagePoolTextureMaxKb, image_pool_texture_max_kb)
     SETTING_FORWARD(m_gpu, ArenaEvictIdleS, arena_evict_idle_s)
+    SETTING_FORWARD_BOOL(m_gpu, RenderStateMemo, render_state_memo)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

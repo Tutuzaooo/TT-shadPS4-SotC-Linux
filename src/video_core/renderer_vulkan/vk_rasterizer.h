@@ -144,7 +144,10 @@ private:
     /// mapped_ranges_mutex is still held
     void UpdateMappedPageTable(VAddr addr, u64 size, bool mapped);
     void PrepareRenderState(const GraphicsPipeline* pipeline);
+    /// Look up targets for PrepareRenderState; return false if FindImage creates an image or resolves overlaps
+    bool PrepareRenderStateFull(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
     /// Layout BeginRendering gives the current draw's depth target, none without one
     std::optional<vk::ImageLayout> DepthTargetLayout(const VideoCore::Image& image) const;
     static bool IsReadOnlyDepthLayout(vk::ImageLayout layout);
@@ -313,6 +316,76 @@ private:
     s8 unordered_ring{-1};
     bool game_dispatch_accesses{};
     const u64 unbounded_cap_bytes; ///< unbounded_vsharp_cap_mb in bytes, 0 = off
+
+    // Cache targets while CB/DB registers and target-page images stay the same, and cache render state while targets and metadata stay the
+    // same; exclude clears and feedback loops
+    struct RsTargetsKey {
+        static constexpr size_t MaxBytes =
+            AmdGpu::NUM_COLOR_BUFFERS * (sizeof(AmdGpu::ColorBuffer) + sizeof(AmdGpu::CbDbExtent)) +
+            sizeof(AmdGpu::DepthBuffer) + sizeof(AmdGpu::DepthView) + sizeof(AmdGpu::CbDbExtent) +
+            64;
+        std::array<u8, MaxBytes> bytes;
+        u32 size;
+        bool operator==(const RsTargetsKey& other) const noexcept;
+    };
+    struct RsTargetsMemo {
+        bool valid{};
+        RsTargetsKey key;
+        u64 image_sets{};
+        u32 num_cbs{};
+        std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
+        std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
+    };
+    struct RsBeginSig {
+        static constexpr u32 NumTargets = AmdGpu::NUM_COLOR_BUFFERS + 1;
+        std::array<VideoCore::ImageId, NumTargets> ids{};
+        std::array<u64, NumTargets> uids{};
+        std::array<VideoCore::ImageViewInfo, NumTargets> views{};
+        std::array<VAddr, NumTargets> metas{};
+        std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
+        u32 mrt_mask{};
+        u64 meta_generation{};
+        bool depth_clear{};
+        bool stencil_clear{};
+        bool depth_valid{};
+        bool stencil_valid{};
+        bool depth_shared{};
+        bool operator==(const RsBeginSig&) const = default;
+    };
+    struct RsBeginMemo {
+        bool valid{};
+        RsBeginSig sig;
+        RenderState state;
+        std::array<const VideoCore::Image::BackingImage*, RsBeginSig::NumTargets> backings{};
+    };
+    using RsBackings = decltype(RsBeginMemo::backings);
+    void MakeTargetsKey(const GraphicsPipeline* pipeline, RsTargetsKey& out) const;
+    bool TargetsUnchanged(const RsTargetsMemo& memo) const;
+    void ReuseTargets(const RsTargetsMemo& memo);
+    RsBeginSig MakeBeginSig(const GraphicsPipeline* pipeline);
+    /// Check whether the full path would produce the cached state for these targets
+    bool BeginMemoHolds(const RsBeginSig& sig);
+    /// Return the cached state after per-draw updates, or none if an update changed a backing
+    std::optional<RenderState> ReuseBeginState();
+    void StoreBeginMemo(const GraphicsPipeline* pipeline, const RenderState& state);
+    RsBackings TargetBackings(const RsBeginSig& sig);
+    /// SHADPS4_RS_MEMO_VERIFY counts checks, logs the first mismatches and reports totals once a minute
+    void VerifyRenderStateMemo(bool matches, const GraphicsPipeline* pipeline, bool targets,
+                               const RenderState* memo, const RenderState* full);
+    const bool rs_memo;
+    const bool rs_memo_toggle; ///< Follow SHADPS4_AB_TOGGLE for render_state_memo
+    /// Rebuild reused results through the full path during SHADPS4_RS_MEMO_VERIFY and draw with that result
+    const bool rs_memo_verify;
+    bool rs_memo_on{}; ///< State for the draw being recorded
+    RsTargetsMemo rs_targets;
+    RsBeginMemo rs_begin;
+    u64 rs_verify_draws{};
+    u64 rs_verify_targets{}; ///< Reused target lookups
+    u64 rs_verify_states{};  ///< Reused render states
+    u64 rs_verify_target_mismatches{};
+    u64 rs_verify_state_mismatches{};
+    std::chrono::steady_clock::time_point rs_verify_last_report{};
+
     u64 bind_verify_checks{};
     u64 bind_verify_mismatches{};
     u64 bind_verify_raced{};
