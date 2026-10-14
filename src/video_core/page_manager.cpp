@@ -633,6 +633,24 @@ struct SignalImpl : public PageManager::Impl {
                                 : rasterizer->ReadMemory(addr, size, is_gpu_thread);
         if (handled && is_write && !is_gpu_thread) {
             rasterizer->ExtendWriteFault(addr);
+            // PINK_FAULT_DELAY_US=<n> (experiment): every write fault of a game thread costs n
+            // microseconds more. How much the FPS drops shows how much faster the game would run
+            // without write faults (tracking writes through the kernel instead)
+            static const u64 delay_ns = [] {
+                const char* v = std::getenv("PINK_FAULT_DELAY_US");
+                const u64 us = v ? std::strtoull(v, nullptr, 10) : 0;
+                if (us != 0) {
+                    LOG_WARNING(Render, "Experiment: write faults cost {} us more", us);
+                }
+                return us * 1000;
+            }();
+            if (delay_ns != 0) {
+                const auto until =
+                    std::chrono::steady_clock::now() + std::chrono::nanoseconds(delay_ns);
+                while (std::chrono::steady_clock::now() < until) {
+                    _mm_pause();
+                }
+            }
         }
         if (handled && EmulatorSettings.IsPreserveSplitProtection()) {
             const Common::PerfStats::ScopedTimer repair_timer{
