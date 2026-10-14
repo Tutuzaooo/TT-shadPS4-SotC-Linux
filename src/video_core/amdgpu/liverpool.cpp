@@ -121,9 +121,20 @@ void Worker() {
         const u64 now = NowNs();
         if (now < due) {
             // The OS timer has roughly 1 ms resolution, so sleep for most of the remaining delay
-            // and yield near the deadline
-            if (due - now > 1'500'000) {
-                timer_cv.wait_for(lk, std::chrono::nanoseconds{due - now - 1'000'000});
+            // and yield near the deadline. On Linux timed waits are good to tens of microseconds:
+            // PINK_LABEL_SPIN_US=<n> sleeps until n us before the deadline and yields only then
+            // (the yield loop kept this thread at about 30% of a core with labels every few
+            // hundred microseconds)
+            static const std::pair<u64, u64> spin = [] {
+                const char* v = std::getenv("PINK_LABEL_SPIN_US");
+                if (!v) {
+                    return std::pair<u64, u64>{1'500'000, 1'000'000};
+                }
+                const u64 ns = std::strtoull(v, nullptr, 10) * 1000;
+                return std::pair<u64, u64>{ns, ns};
+            }();
+            if (due - now > spin.first) {
+                timer_cv.wait_for(lk, std::chrono::nanoseconds{due - now - spin.second});
             } else {
                 lk.unlock();
                 std::this_thread::yield();

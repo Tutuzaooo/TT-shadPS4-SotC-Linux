@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #ifdef _WIN32
@@ -853,7 +855,12 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     // The command processor publishes another batch every few microseconds while working
     // Keep the consumer spinning briefly between batches to avoid making the producer wake it for
     // every small update
-    constexpr auto SpinTime = std::chrono::microseconds{250};
+    // PINK_REC_SPIN_US=<n> overrides the 250 us: this thread spent about 70% of a core spinning
+    // here, on a CPU whose other hyperthread runs the command processor or the game
+    static const auto SpinTime = std::chrono::microseconds([] {
+        const char* v = std::getenv("PINK_REC_SPIN_US");
+        return v ? std::max(0, std::atoi(v)) : 250;
+    }());
     constexpr auto SleepTime = std::chrono::microseconds{500};
 
     Chunk* chunk = first_chunk;
