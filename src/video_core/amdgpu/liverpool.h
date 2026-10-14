@@ -19,6 +19,7 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/reg_dirty.h"
 #include "video_core/amdgpu/regs.h"
 
 namespace Vulkan {
@@ -60,9 +61,12 @@ struct Liverpool {
         CbColor7Cmask = 0xA388,
     };
 
+    /// Mark reg_dirty whenever regs changes so stage B receives the updated registers
     Regs regs{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    /// Register blocks changed since the previous draw or dispatch; see reg_dirty.h
+    RegDirty reg_dirty{};
 
 public:
     explicit Liverpool();
@@ -192,6 +196,13 @@ private:
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
+    /// Registers assigned by IT_DRAW_INDEX_* packets
+    void MarkDrawRegs() noexcept {
+        reg_dirty.MarkField(regs, regs.max_index_size);
+        reg_dirty.MarkField(regs, regs.index_base_address);
+        reg_dirty.MarkField(regs, regs.num_indices);
+        reg_dirty.MarkField(regs, regs.draw_initiator);
+    }
     /// Perf stats: a label written by the submission `qid` is processing (label_lag_ms)
     void RecordLabelLag(u32 qid);
     void Process(std::stop_token stoken);

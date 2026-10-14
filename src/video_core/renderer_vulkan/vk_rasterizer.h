@@ -12,6 +12,7 @@
 #include "video_core/mapped_page_table.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bind_cache.h"
+#include "video_core/renderer_vulkan/vk_draw_packet.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -27,6 +28,7 @@ class MemoryManager;
 
 namespace Vulkan {
 
+class ComputePipeline;
 class GraphicsPipeline;
 class Runtime;
 
@@ -162,7 +164,32 @@ private:
     void UpdateRasterizationState() const;
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
-    bool FilterDraw();
+    /// Describe a replacement operation for this draw using the current stage's registers; None keeps the draw, and copy flags apply to
+    /// DepthStencilCopy
+    DrawPacket::Filter FilterDraw(u8& depth_copy, u8& stencil_copy) const;
+    void RunFilter(const DrawPacket::Header& packet);
+
+    // Stage A filters the draw, selects its pipeline and builds a packet; stage B records it immediately afterward on the command processor
+    // thread, using Regs(), extent accessors and Shader::Info accessors to read the packet's state
+    void DrawPrepare(bool is_indexed, u32 index_offset);
+    void DrawIndirectPrepare(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
+                             u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
+                             u16 instance_sgpr_offset);
+    void DispatchPrepare(bool indirect, VAddr address, u32 size, s8 ring);
+    /// Write the packet header, changed register blocks, target extents and each pipeline stage's user data
+    DrawPacket::Header& BuildPacket(DrawPacket::Kind kind, const Pipeline* pipeline, bool compute);
+    void RunPacket();
+    /// SHADPS4_PIPE_VERIFY=N compares stage B's captured state with live state every N packets
+    void VerifyPacket(const DrawPacket::Header& packet);
+    void DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed, VAddr arg_address,
+                            u32 stride, u32 max_count, VAddr count_address);
+    void DispatchRecord(const ComputePipeline* pipeline);
+    void DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address, u32 size);
+    const AmdGpu::Regs& Regs() const;
+    AmdGpu::CbDbExtent CbExtent(u32 index) const;
+    AmdGpu::CbDbExtent DbExtent() const;
+    const AmdGpu::ComputeProgram& CsRegs() const;
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
@@ -403,6 +430,20 @@ private:
     u64 tsharp_array_binds_minute{};
     u64 tsharp_array_null_minute{};
     std::chrono::steady_clock::time_point tsharp_array_last_report{};
+    // Store the growing, 8-byte aligned packet buffer, stage B's registers and extents, and the active packet view; outside recording,
+    // accessors use live state
+    std::unique_ptr<u64[]> packet_buffer;
+    u32 packet_capacity{};
+    std::unique_ptr<AmdGpu::Regs> pipe_regs;
+    std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> pipe_cb_extent{};
+    AmdGpu::CbDbExtent pipe_db_extent{};
+    static inline thread_local const AmdGpu::Regs* stage_regs = nullptr;
+    static inline thread_local const AmdGpu::ComputeProgram* stage_cs = nullptr;
+    const u32 pipe_verify_interval; ///< SHADPS4_PIPE_VERIFY interval; 0 disables checks
+    u64 pipe_verify_packets{};
+    u64 pipe_verify_checks{};
+    u64 pipe_verify_mismatches{};
+    std::chrono::steady_clock::time_point pipe_verify_last_report{};
 };
 
 } // namespace Vulkan
