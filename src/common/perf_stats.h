@@ -224,8 +224,8 @@ enum class Id : u32 {
     FillHleReadbacks,
     FillHleVerifyChecks,
     FillHleVerifyMismatches,
-    // Count draw-pipe packets and tasks, drain time, recording and packing time, pending-write ranges, walker checks and waits, yielding CP
-    // waits, and verification results
+    // Count draw-pipe packets and tasks, drain and recording times, packing time, pending-write ranges, walker checks and waits, yielding
+    // CP waits, verification results, and waits satisfied by pending fences
     PipePackets,
     PipeDrains,
     PipeDrainNs,
@@ -240,6 +240,7 @@ enum class Id : u32 {
     PipeVerifyChecks,
     PipeVerifyMismatches,
     PipeTasks,
+    PipeFenceWaits,
     Count,
 };
 

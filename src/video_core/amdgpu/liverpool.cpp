@@ -64,24 +64,17 @@ static void LogSync(std::string_view queue, fmt::format_string<Args...> format, 
                 fmt::format(format, std::forward<Args>(args)...));
 }
 
-/// Delay gfx EOP labels with a timer as a temporary workaround for the SotC rock flicker
-/// The game starts CPU visibility jobs after reading the previous BOTTOM_OF_PIPE label for their
-/// memory
-/// Writing that label as soon as the packet is read can release the jobs too early and put their
-/// output in another frame
-/// The timer adds a fixed delay without waiting for the GPU or submitting work, and 2000 us helped
-/// in earlier tests
-/// It can still publish the label too early when the GPU falls behind, and readback_ahead can bring
-/// the flicker back
-/// A complete fix still needs to publish labels after the GPU finishes the commands before them
-/// Treat the delay as a timing adjustment rather than proof that the preceding work has completed,
-/// because the timer cannot see how far the GPU has progressed
+/// Delay gfx EOP labels to reduce SotC rock flicker when visibility jobs start too early; the timer adds a fixed delay without waiting for
+/// GPU completion, and 2000 us helped earlier tests; it can still release work too early under GPU load, and readback_ahead can restore
+/// flicker; a full fix needs GPU-completion tracking; draw_pipe_steps fences also use pending values until the recording thread writes
+/// their labels
 namespace DelayedLabels {
 namespace {
 struct Pending {
     u64 value;
     u32 bytes;
     u64 seq;
+    bool pipe; ///< Write this draw_pipe_steps label when the recording thread reaches it
 };
 std::mutex pending_mutex;
 std::unordered_map<VAddr, Pending> pending;
@@ -160,13 +153,24 @@ u32 DelayUs() {
     return delay_us;
 }
 
-/// Keep the label waiting for its timer together with the value that command processor waits should
-/// already see
-u64 AddPending(VAddr addr, u64 value, u32 bytes) {
+/// Queue the label and the value CP waits should already see, for either a timer or a pipe fence; called by the command processor in
+/// command order
+u64 AddPending(VAddr addr, u64 value, u32 bytes, bool pipe = false) {
     std::scoped_lock lock{pending_mutex};
-    pending[addr] = Pending{value, bytes, ++next_seq};
+    pending[addr] = Pending{value, bytes, ++next_seq, pipe};
     pending_count.store(static_cast<u32>(pending.size()), std::memory_order_release);
     return next_seq;
+}
+
+/// Queue Data32Low or Data64 from EOP or RELEASE_MEM; return 0 for timestamps, GDS and other data CP waits do not compare
+u64 AddPendingData(VAddr addr, DataSelect data_sel, u64 data, bool pipe) {
+    if (data_sel == DataSelect::Data32Low) {
+        return AddPending(addr, static_cast<u32>(data), sizeof(u32), pipe);
+    }
+    if (data_sel == DataSelect::Data64) {
+        return AddPending(addr, data, sizeof(u64), pipe);
+    }
+    return 0;
 }
 
 void RemovePending(VAddr addr, u64 seq) {
@@ -178,16 +182,21 @@ void RemovePending(VAddr addr, u64 seq) {
     }
 }
 
-std::optional<u32> PendingDword(VAddr addr) {
+struct PendingValue {
+    u32 dword;
+    bool pipe;
+};
+
+std::optional<PendingValue> PendingDword(VAddr addr) {
     if (pending_count.load(std::memory_order_acquire) == 0) {
         return std::nullopt;
     }
     std::scoped_lock lock{pending_mutex};
     if (const auto it = pending.find(addr); it != pending.end()) {
-        return static_cast<u32>(it->second.value);
+        return PendingValue{static_cast<u32>(it->second.value), it->second.pipe};
     }
     if (const auto it = pending.find(addr - 4); it != pending.end() && it->second.bytes == 8) {
-        return static_cast<u32>(it->second.value >> 32);
+        return PendingValue{static_cast<u32>(it->second.value >> 32), it->second.pipe};
     }
     return std::nullopt;
 }
@@ -204,17 +213,33 @@ void Push(u64 delay_ns, Common::UniqueFunction<void>&& func) {
 }
 } // namespace DelayedLabels
 
-/// Check WAIT_REG_MEM using the value visible to the command processor in command order
-/// With eop_label_delay_us, a pending label already has its queued value for these waits even
-/// before the timer writes guest memory
+/// Check WAIT_REG_MEM against the value visible in command order, including labels still waiting on a timer or recording-thread fence
 static bool CpWaitPasses(const PM4CmdWaitRegMem* wait, std::span<const u32> regs) {
-    if (DelayedLabels::DelayUs() != 0 &&
-        wait->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
-        if (const auto value = DelayedLabels::PendingDword(wait->Address<VAddr>())) {
-            return wait->TestValue(*value);
+    if (wait->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+        if (const auto pending = DelayedLabels::PendingDword(wait->Address<VAddr>())) {
+            const bool passes = wait->TestValue(pending->dword);
+            if (passes && pending->pipe) {
+                Common::PerfStats::Add(Common::PerfStats::Id::PipeFenceWaits);
+            }
+            return passes;
         }
     }
     return wait->Test(regs);
+}
+
+/// Write labels through the backing; late timer or recording-thread writes may find unmapped guest memory, so warn and drop those instead
+/// of asserting
+static void WriteLabel(void* address, u64 data, u32 num_bytes, u64 queue, bool late) {
+    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
+                                      reinterpret_cast<u64>(address), num_bytes, &data, queue);
+    if (Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes)) {
+        return;
+    }
+    ASSERT_MSG(late, "Label {} could not be written", fmt::ptr(address));
+    LOG_WARNING(Render,
+                "Label {} unmapped before its write (eop_label_delay_us, draw_pipe_steps), "
+                "dropped",
+                fmt::ptr(address));
 }
 
 namespace CpHistory {
@@ -351,6 +376,24 @@ static bool PipelinedOpcode(const PM4Header* header, bool compute_queue) {
         return !compute_queue;
     default:
         // Drain for fences, data writes and copies, LOD statistics, conditional execution and semaphore signals
+        return false;
+    }
+}
+
+/// Decide once before draining whether this fence runs on the recording thread; WRITE_DATA, DMA_DATA and GET_LOD_STATS still drain and run
+/// here because flip handling checks a WRITE_DATA label
+static bool PipeTaskOpcode(const PM4Header* header, const Vulkan::Rasterizer& rasterizer) {
+    using Step = Vulkan::Rasterizer::PipeStep;
+    switch (header->type3.opcode.Value()) {
+    case PM4ItOpcode::EventWriteEop:
+    case PM4ItOpcode::ReleaseMem:
+        return rasterizer.PipeStepOn(Step::Fences);
+    case PM4ItOpcode::EventWriteEos:
+        // Finish GPU work before reading GDS for the store
+        return reinterpret_cast<const PM4CmdEventWriteEos*>(header)->command ==
+                   PM4CmdEventWriteEos::Command::SignalFence &&
+               rasterizer.PipeStepOn(Step::Fences);
+    default:
         return false;
     }
 }
@@ -659,7 +702,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 CpHistory::RecordPacket(CpHistory::Queue::De, dcb);
             }
             ++cp_progress;
-            if (rasterizer && rasterizer->DrawPipeBusy() && !PipelinedOpcode(header, false)) {
+            // Queue the fence on the recording thread in command order
+            const bool pipe_task = rasterizer && PipeTaskOpcode(header, *rasterizer);
+            if (rasterizer && !pipe_task && rasterizer->DrawPipeBusy() &&
+                !PipelinedOpcode(header, false)) {
                 rasterizer->DrainDrawPipe();
             }
             switch (opcode) {
@@ -1111,16 +1157,39 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             event_eos->event_type.Value(), u32(event_eos->command.Value()),
                             event_eos->Address<VAddr>(), event_eos->data);
                 }
+                RecordLabelLag(GfxQueueId);
+                if (event_eos->command == PM4CmdEventWriteEos::Command::SignalFence) {
+                    const PM4CmdEventWriteEos packet = *event_eos;
+                    const auto label_addr = event_eos->Address<VAddr>();
+                    // Let CP waits see the pending label until the recording thread writes it
+                    const u64 seq = pipe_task
+                                        ? DelayedLabels::AddPending(label_addr, packet.DataDWord(),
+                                                                    sizeof(u32), true)
+                                        : 0;
+                    const auto fence = [this, packet, label_addr, seq, pipe_task] {
+                        if (rasterizer) {
+                            rasterizer->OnFence();
+                        }
+                        // The guest may have unmapped this label before the recording thread reaches it
+                        packet.SignalFence([pipe_task](void* address, u64 data, u32 num_bytes) {
+                            WriteLabel(address, data, num_bytes, 0, pipe_task);
+                        });
+                        if (seq != 0) {
+                            DelayedLabels::RemovePending(label_addr, seq);
+                        }
+                    };
+                    if (rasterizer) {
+                        rasterizer->RunInOrder(pipe_task, fence);
+                    } else {
+                        fence();
+                    }
+                    break;
+                }
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
-                RecordLabelLag(GfxQueueId);
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
-                    auto* memory = Core::Memory::Instance();
-                    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
-                                                      reinterpret_cast<u64>(address), num_bytes,
-                                                      &data, 0);
-                    ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                    WriteLabel(address, data, num_bytes, 0, false);
                 });
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
@@ -1143,59 +1212,62 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             u32(event_eop->int_sel.Value()), fmt::ptr(event_eop->Address<u32>()),
                             event_eop->data_lo);
                 }
-                if (rasterizer) {
-                    rasterizer->OnFence();
-                }
                 RecordLabelLag(GfxQueueId);
-                const auto write_label = [](void* address, u64 data, u32 num_bytes) {
-                    auto* memory = Core::Memory::Instance();
-                    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
-                                                      reinterpret_cast<u64>(address), num_bytes,
-                                                      &data, 1);
-                    ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                };
                 const auto signal_irq = [] {
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                 };
-                // With eop_label_delay_us, write this gfx label and raise its interrupt after the
-                // fixed timer delay
-                // GPU timestamps and video output labels still use their normal immediate write
-                // path
+                // Delay gfx labels and interrupts from this recording turn when eop_label_delay_us is enabled; GPU timestamps and video
+                // output labels keep their immediate path
+                const PM4CmdEventWriteEop packet = *event_eop;
+                const auto label_addr = reinterpret_cast<VAddr>(event_eop->Address<u8>());
                 const auto data_sel = event_eop->data_sel.Value();
-                if (const u32 delay_us = DelayedLabels::DelayUs();
-                    delay_us != 0 && data_sel != DataSelect::GpuClock64 &&
-                    data_sel != DataSelect::PerfCounter &&
-                    !vo_port->IsVoLabel(event_eop->Address<u64>())) {
-                    const PM4CmdEventWriteEop packet = *event_eop;
-                    const auto label_addr = reinterpret_cast<VAddr>(event_eop->Address<u8>());
-                    const u64 seq =
-                        data_sel == DataSelect::Data32Low
-                            ? DelayedLabels::AddPending(label_addr, packet.DataDWord(), sizeof(u32))
-                        : data_sel == DataSelect::Data64
-                            ? DelayedLabels::AddPending(label_addr, packet.DataQWord(), sizeof(u64))
-                            : 0;
-                    // The guest may have unmapped this label while the timer was waiting, so drop
-                    // the delayed write instead of aborting on an invalid address
-                    const auto write_delayed = [](void* address, u64 data, u32 num_bytes) {
-                        Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
-                                                          reinterpret_cast<u64>(address), num_bytes,
-                                                          &data, 1);
-                        if (!Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes)) {
-                            LOG_WARNING(Render, "eop_label_delay_us: label {} unmapped before its "
-                                                "delayed write, dropped",
-                                        fmt::ptr(address));
-                        }
-                    };
-                    DelayedLabels::Push(u64{delay_us} * 1000,
-                                        [packet, write_delayed, signal_irq, label_addr, seq] {
-                                            packet.SignalFence(write_delayed, signal_irq);
-                                            if (seq != 0) {
-                                                DelayedLabels::RemovePending(label_addr, seq);
-                                            }
-                                        });
-                    break;
+                const u32 delay_setting = DelayedLabels::DelayUs();
+                const u32 delay_us = delay_setting != 0 && data_sel != DataSelect::GpuClock64 &&
+                                             data_sel != DataSelect::PerfCounter &&
+                                             !vo_port->IsVoLabel(event_eop->Address<u64>())
+                                         ? delay_setting
+                                         : 0;
+                // Publish pending values in command order for CP waits until the timer or recording thread writes the label
+                const u64 seq = delay_us != 0 || pipe_task
+                                    ? DelayedLabels::AddPendingData(label_addr, data_sel,
+                                                                    packet.DataQWord(), pipe_task)
+                                    : 0;
+                const auto fence = [this, packet, signal_irq, label_addr, delay_us, seq,
+                                    pipe_task] {
+                    if (rasterizer) {
+                        rasterizer->OnFence();
+                    }
+                    if (delay_us != 0) {
+                        // Pass a temporary because UniqueFunction would retain an lvalue reference to this ring task; drop the write if the
+                        // guest unmapped its label while the timer waited
+                        DelayedLabels::Push(
+                            u64{delay_us} * 1000, [packet, signal_irq, label_addr, seq] {
+                                packet.SignalFence(
+                                    [](void* address, u64 data, u32 num_bytes) {
+                                        WriteLabel(address, data, num_bytes, 1, true);
+                                    },
+                                    signal_irq);
+                                if (seq != 0) {
+                                    DelayedLabels::RemovePending(label_addr, seq);
+                                }
+                            });
+                        return;
+                    }
+                    // The guest may have unmapped this label before the recording thread reaches it
+                    packet.SignalFence(
+                        [pipe_task](void* address, u64 data, u32 num_bytes) {
+                            WriteLabel(address, data, num_bytes, 1, pipe_task);
+                        },
+                        signal_irq);
+                    if (seq != 0) {
+                        DelayedLabels::RemovePending(label_addr, seq);
+                    }
+                };
+                if (rasterizer) {
+                    rasterizer->RunInOrder(pipe_task, fence);
+                } else {
+                    fence();
                 }
-                event_eop->SignalFence(write_label, signal_irq);
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -1507,7 +1579,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             CpHistory::RecordPacket(static_cast<s16>(vqid), acb);
         }
         ++cp_progress;
-        if (rasterizer && rasterizer->DrawPipeBusy() && !PipelinedOpcode(header, true)) {
+        const bool pipe_task = rasterizer && PipeTaskOpcode(header, *rasterizer);
+        if (rasterizer && !pipe_task && rasterizer->DrawPipeBusy() &&
+            !PipelinedOpcode(header, true)) {
             rasterizer->DrainDrawPipe();
         }
 
@@ -1758,17 +1832,41 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         u64(release_mem->address_hi) << 32 | release_mem->address_lo,
                         release_mem->data_lo);
             }
-            if (rasterizer) {
-                rasterizer->OnFence();
-            }
             RecordLabelLag(vqid + 1);
-            release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
-                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
-                });
+            const PM4CmdReleaseMem packet = *release_mem;
+            const auto label_addr = release_mem->Address<VAddr>();
+            u64 seq = 0;
+            if (pipe_task) {
+                // Let CP waits see the pending label until the recording thread writes it
+                const auto data_sel = packet.data_sel.Value();
+                seq = DelayedLabels::AddPendingData(label_addr, data_sel, packet.DataQWord(), true);
+                if (data_sel == DataSelect::GdsMemStore) {
+                    // Track this recording-thread GPU copy outside packet bindings
+                    rasterizer->NetPendingWrite(label_addr, u64{packet.num_dw} * sizeof(u32));
+                }
+            }
+            const auto fence = [this, packet, pipe_id = queue.pipe_id, label_addr, seq] {
+                if (rasterizer) {
+                    rasterizer->OnFence();
+                }
+                packet.SignalFence(
+                    [pipe_id] {
+                        Platform::IrqC::Instance()->Signal(
+                            static_cast<Platform::InterruptId>(pipe_id));
+                    },
+                    [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                        rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
+                                               true);
+                    });
+                if (seq != 0) {
+                    DelayedLabels::RemovePending(label_addr, seq);
+                }
+            };
+            if (rasterizer) {
+                rasterizer->RunInOrder(pipe_task, fence);
+            } else {
+                fence();
+            }
             break;
         }
         case PM4ItOpcode::EventWrite: {
