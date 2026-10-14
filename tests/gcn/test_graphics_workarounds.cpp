@@ -6,6 +6,7 @@
 // are written there so spirv-val can check them
 
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -343,6 +344,79 @@ TEST(DynamicTsharpArray, SamplesThroughDescriptorArrayElement) {
     EXPECT_TRUE(loads_element);
     // Bindings: the array takes ArraySize + 1 slots, then the sampler
     EXPECT_EQ(bindings.unified, ArraySize + 1 + 1);
+}
+
+using EmitBound = std::function<IR::U32(IR::IREmitter&)>;
+
+/// A dword flattened by the SRT walker at flat[location]
+EmitBound FlatRead(u16 location) {
+    return [location](IR::IREmitter& ir) {
+        const IR::Value ptr = ir.CompositeConstruct(ir.GetUserData(IR::ScalarReg::S2),
+                                                    ir.GetUserData(IR::ScalarReg::S3));
+        const IR::U32 value = ir.ReadConst(ptr, ir.Imm32(u32{location} * 4));
+        value.Inst()->SetFlags<SharpLocation>(location);
+        return value;
+    };
+}
+
+/// Model the translator's loop: entry -> header with Phi(0, i + 1) and i < n -> body with an optional i < m guard -> latch -> header;
+/// branch conditions remain ConditionRefs, as in vs 0x9d6f9bf4
+u16 LoopCountLocation(const EmitBound& loop_bound, const EmitBound& guard_bound = {}) {
+    Pools pools{};
+    IR::Block* entry = pools.block_pool.Create(pools.inst_pool);
+    IR::Block* header = pools.block_pool.Create(pools.inst_pool);
+    IR::Block* body = pools.block_pool.Create(pools.inst_pool);
+    IR::Block* latch = pools.block_pool.Create(pools.inst_pool);
+    IR::IREmitter entry_ir{*entry};
+    const IR::U32 n = loop_bound(entry_ir);
+    const IR::U32 m = guard_bound ? guard_bound(entry_ir) : IR::U32{};
+
+    IR::Inst* phi = &*header->PrependNewInst(header->begin(), IR::Opcode::Phi);
+    phi->SetFlags(IR::Type::U32);
+    const IR::U32 i{IR::Value{phi}};
+    IR::IREmitter header_ir{*header};
+    header->branch_cond =
+        header_ir.ConditionRef(header_ir.LogicalNot(header_ir.ILessThan(i, n, true)));
+    if (guard_bound) {
+        IR::IREmitter body_ir{*body};
+        body->branch_cond = body_ir.ConditionRef(body_ir.ILessThan(i, m, true));
+    }
+    IR::IREmitter latch_ir{*latch};
+    const IR::U32 next{latch_ir.IAdd(i, latch_ir.Imm32(1u))};
+    phi->AddPhiOperand(entry, IR::Value{0u});
+    phi->AddPhiOperand(latch, next);
+    return Optimization::FindLoopCountLocation(i);
+}
+
+// vs 0x9d6f9bf4 indexes two T# tables with a loop-header bound of i < flat[60]
+TEST(DynamicTsharpArrayCount, FindsTopTestedLoopBound) {
+    EXPECT_EQ(LoopCountLocation(FlatRead(60)), 60u);
+}
+
+// s0 uses location 0, so 0 cannot mean a missing bound
+TEST(DynamicTsharpArrayCount, AcceptsUserDataRegisterZero) {
+    const auto s0 = [](IR::IREmitter& ir) { return ir.GetUserData(IR::ScalarReg::S0); };
+    EXPECT_EQ(LoopCountLocation(s0), 0u);
+}
+
+// A body guard such as `if (i < skip) continue` does not limit the table indices
+TEST(DynamicTsharpArrayCount, IgnoresGuardInBody) {
+    const auto eight = [](IR::IREmitter& ir) { return ir.Imm32(8u); };
+    EXPECT_EQ(LoopCountLocation(eight, FlatRead(61)), UNKNOWN_LOCATION);
+    EXPECT_EQ(LoopCountLocation(FlatRead(60), FlatRead(61)), 60u);
+}
+
+// ReadConstBuffer uses the bound buffer rather than the flat buffer used by refresh
+TEST(DynamicTsharpArrayCount, IgnoresConstantBufferCount) {
+    const auto cbuf = [](IR::IREmitter& ir) {
+        const IR::Value handle = ir.CompositeConstruct(
+            ir.GetUserData(IR::ScalarReg::S4), ir.GetUserData(IR::ScalarReg::S5),
+            ir.GetUserData(IR::ScalarReg::S6), ir.GetUserData(IR::ScalarReg::S7));
+        IR::BufferInstInfo buffer_info{};
+        buffer_info.flatbuf_off_dw.Assign(62);
+        return ir.ReadConstBuffer(handle, ir.Imm32(0u), buffer_info);
+    };
+    EXPECT_EQ(LoopCountLocation(cbuf), UNKNOWN_LOCATION);
 }
 
 } // namespace

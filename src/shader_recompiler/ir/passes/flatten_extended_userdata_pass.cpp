@@ -739,8 +739,8 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
 }
 
 /// Detect offsets that depend on a loop counter or a per-lane pointer, including reads through those offsets; the walker runs once before
-/// dispatch, so these reads keep flat offset 0 and use DMA through read_const_dynamic; without DMA, CollectShaderInfoPass reports a broken
-/// shader
+/// dispatch, so data reads keep flat offset 0 and use DMA through read_const_dynamic; CollectShaderInfoPass reports an error without DMA,
+/// while sharp reads bind null and are reported by ConstructSharpFetch
 static bool IsRuntimeOffset(const IR::Value& off_dw, u32 depth = 0) {
     if (off_dw.IsImmediate() || depth == 16) {
         return false;
@@ -964,7 +964,9 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         emitted = false;
     }
     if (pass_info.runtime_offset_reads != 0) {
-        LOG_INFO(Render_Recompiler, "Shader {:#x} reads {} SRT dwords at runtime offsets through DMA",
+        // DMA handles data reads only; ConstructSharpFetch reports unflattened sharps as errors
+        LOG_INFO(Render_Recompiler,
+                 "Shader {:#x} reads {} SRT dwords at runtime offsets, left unflattened",
                  info.pgm_hash, pass_info.runtime_offset_reads);
     }
 

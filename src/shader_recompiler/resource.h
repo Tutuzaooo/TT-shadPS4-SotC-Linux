@@ -66,7 +66,7 @@ struct SharpFetch {
 
 /// dynamic_tsharp_array_size describes a guest T# table indexed as ReadConst(ptr, element * stride_dw + offset_dw + k); refreshes copy
 /// num_elements * stride_dw dwords from ptr + offset_dw * 4 to flatbuf_off; count_loc holds a flattened loop bound, and entries from that
-/// bound onward are zeroed to bind null images
+/// bound onward bind null; graphics tables without a bound stay null
 struct SharpTable {
     SharpLocation ptr_lo;
     SharpLocation ptr_hi;
@@ -74,7 +74,7 @@ struct SharpTable {
     u16 num_elements;
     u32 offset_dw;
     u32 stride_dw;
-    SharpLocation count_loc; // 0 allows reads from every element
+    SharpLocation count_loc; // UNKNOWN_LOCATION means no loop bound; every element may be read
 
     u32 NumDwords() const noexcept {
         return num_elements * stride_dw;

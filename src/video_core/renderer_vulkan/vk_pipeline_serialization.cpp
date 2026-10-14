@@ -16,10 +16,11 @@ namespace Serialization {
 // Binary 6 adds walker recovery, descriptor tolerance for 10_11_11 and add_tid, and DMA bitmap bounds checks and atomics; meta 6 adds the
 // codegen key and uses_loop_cap; meta 7 adds early_fragment_tests, sharp_tables and image array fields; meta 8 changes SharpFetch and
 // FetchShaderData for #5112 and one_vgprs; meta 9 adds clean-page checks for srt_walker_clean_reads; binary 7 limits Flat subgroup inputs
-// to fragment shaders; binary 8 includes ISA fixes #5030, #5031, #5141, #5185, #5186, #5194, #5199, #5200 and #5202; meta 10 adds
-// SharpTable::count_loc and T# arrays in graphics stages
+// to fragment shaders; binary 8 includes ISA fixes #5030, #5031, #5141, #5185, #5186, #5194, #5199, #5200 and #5202; meta 10 adds count_loc
+// and graphics T# arrays; meta 11 replaces unreleased meta 10, uses UNKNOWN_LOCATION for missing bounds and requires a flat loop-header
+// bound for graphics tables
 static constexpr u32 ShaderBinaryVersion = 8u;
-static constexpr u32 ShaderMetaVersion = 10u;
+static constexpr u32 ShaderMetaVersion = 11u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 

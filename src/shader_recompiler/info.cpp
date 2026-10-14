@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/info.h"
@@ -15,24 +16,32 @@ void Info::RefreshSharpTables() {
     for (const SharpTable& table : sharp_tables) {
         u32* dst = flattened_ud_buf.data() + table.flatbuf_off;
         const u64 size = u64{table.NumDwords()} * sizeof(u32);
+        u32 live = table.num_elements;
+        if (table.count_loc != UNKNOWN_LOCATION) {
+            // Entries past n are not T#s; in SotC's vs 0x9d6f9bf4 they look like a T# over the constant ring and caused a GPU hang
+            const s32 count = static_cast<s32>(flattened_ud_buf[table.count_loc]);
+            live = count <= 0 ? 0u : std::min<u32>(count, table.num_elements);
+            if (count > static_cast<s32>(table.num_elements) && !sharp_table_count_logged) {
+                sharp_table_count_logged = true;
+                LOG_WARNING(
+                    Render_Recompiler,
+                    "Workaround dynamic_tsharp_array_size: shader {:#x} loops over {} T#s of a "
+                    "table of {} (array too small, or a count read before the game wrote it)",
+                    pgm_hash, count, table.num_elements);
+            }
+        }
+        const u64 live_size = u64{live} * table.stride_dw * sizeof(u32);
         const VAddr ptr = (VAddr{flattened_ud_buf[table.ptr_lo]} |
                            VAddr{flattened_ud_buf[table.ptr_hi]} << 32) &
                           AddressMask;
         const VAddr src = ptr + u64{table.offset_dw} * sizeof(u32);
-        // Through the backing, under the memory manager lock: a garbage table pointer may point at free
-        // address space, where a direct read is a host access violation. The tables are written by the CPU,
-        // so the backing is current
-        if (ptr == 0 || !memory->TryReadBacking(src, dst, size)) {
+        // Read only live entries through the backing under the memory manager lock; invalid pointers can hit free address space, and
+        // reading an unbacked tail would fail the whole read; CPU writes keep the backing current
+        if (live_size != 0 && (ptr == 0 || !memory->TryReadBacking(src, dst, live_size))) {
             // Null T#s: the array binds null images, like the unflattened sharp did
-            std::memset(dst, 0, size);
+            std::memset(dst, 0, live_size);
         }
-        if (table.count_loc != 0) {
-            // Entries past n are not T#s; in SotC's vs 0x9d6f9bf4 they look like a T# over the constant ring and caused a GPU hang
-            const s32 count = static_cast<s32>(flattened_ud_buf[table.count_loc]);
-            const u32 live = count <= 0 ? 0u : std::min<u32>(count, table.num_elements);
-            std::memset(dst + live * table.stride_dw, 0,
-                        u64{table.num_elements - live} * table.stride_dw * sizeof(u32));
-        }
+        std::memset(reinterpret_cast<u8*>(dst) + live_size, 0, size - live_size);
     }
 }
 
