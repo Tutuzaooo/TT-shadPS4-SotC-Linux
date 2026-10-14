@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -135,6 +137,55 @@ TEST(SlotVector, EraseAndDestructorDestroyEntries) {
         EXPECT_EQ(live, static_cast<int>(ManyEntries / 2));
     }
     EXPECT_EQ(live, 0);
+}
+
+TEST(SlotVector, ConcurrentInsertsAndErasesHandOutEachIdOnce) {
+    // Exercise deferred texture-cache erases alongside guest-thread inserts
+    constexpr u32 PerThread = 20000;
+    Common::SlotVector<u32> vector;
+    std::vector<SlotId> erased;
+    for (u32 i = 0; i < PerThread; ++i) {
+        erased.push_back(vector.insert(i));
+    }
+    std::vector<SlotId> inserted[2];
+    {
+        std::thread eraser([&] {
+            for (const SlotId id : erased) {
+                vector.erase(id);
+            }
+        });
+        std::thread inserters[2];
+        for (u32 t = 0; t < 2; ++t) {
+            inserters[t] = std::thread([&, t] {
+                for (u32 i = 0; i < PerThread; ++i) {
+                    inserted[t].push_back(vector.insert((t + 1) * PerThread + i));
+                }
+            });
+        }
+        eraser.join();
+        inserters[0].join();
+        inserters[1].join();
+    }
+    std::vector<u32> live;
+    for (u32 t = 0; t < 2; ++t) {
+        for (u32 i = 0; i < PerThread; ++i) {
+            const SlotId id = inserted[t][i];
+            ASSERT_TRUE(vector.is_allocated(id));
+            EXPECT_EQ(vector[id], (t + 1) * PerThread + i);
+            live.push_back(id.index);
+        }
+    }
+    std::ranges::sort(live);
+    EXPECT_EQ(std::ranges::adjacent_find(live), live.end());
+    for (const SlotId id : erased) {
+        EXPECT_EQ(vector.is_allocated(id), std::ranges::binary_search(live, id.index));
+    }
+    u32 visited = 0;
+    for ([[maybe_unused]] const u32 value : vector) {
+        ++visited;
+    }
+    EXPECT_EQ(visited, 2 * PerThread);
+    EXPECT_EQ(vector.size(), 2 * PerThread);
 }
 
 } // namespace

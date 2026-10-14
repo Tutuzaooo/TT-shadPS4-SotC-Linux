@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <mutex>
 #include <numeric>
 #include <utility>
 #include <vector>
@@ -133,20 +134,31 @@ public:
     template <typename... Args>
     SlotId insert(Args&&... args) noexcept {
         // Growing the chunk table keeps existing entries and references in args valid
-        const u32 index = FreeValueIndex();
+        u32 index;
+        {
+            std::scoped_lock lk{free_mutex};
+            index = FreeValueIndex();
+        }
         new (&Value(index).object) T(std::forward<Args>(args)...);
-        SetStorageBit(index);
-
+        {
+            std::scoped_lock lk{free_mutex};
+            SetStorageBit(index);
+        }
         return SlotId{index};
     }
 
     void erase(SlotId id) noexcept {
+        {
+            std::scoped_lock lk{free_mutex};
+            ResetStorageBit(id.index);
+        }
         Value(id.index).object.~T();
+        std::scoped_lock lk{free_mutex};
         free_list.push_back(id.index);
-        ResetStorageBit(id.index);
     }
 
     std::size_t size() const noexcept {
+        std::scoped_lock lk{free_mutex};
         return values_capacity - free_list.size();
     }
 
@@ -281,6 +293,9 @@ private:
     std::array<Chunk*, MaxChunks> chunks{};
     std::size_t values_capacity = 0;
 
+    /// Protect the free list, chunk growth and shared occupancy words with a leaf lock; deferred texture-cache erases may overlap guest
+    /// inserts; construct and destroy entries outside the lock, and leave lookups and iteration lock-free
+    mutable std::mutex free_mutex;
     std::vector<u32> free_list;
 };
 
