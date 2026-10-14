@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <unordered_map>
+#include <vector>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -160,6 +162,82 @@ void BufferCache::TickFrame() {
     ReportLoopCapHits();
     DebugState.num_batches_per_frame = std::exchange(num_flushes_per_frame, 0u);
 }
+
+/// SHADPS4_PERF_STATS: whether readbacks bring anything new. Each downloaded run is compared with
+/// what the guest memory already holds: a readback whose bytes are all equal was not needed (the
+/// binding counted as written, but the shader did not write there, or wrote the same values).
+/// One line every 10 s with totals and the windows (64 KiB) read back most often. Owner thread only
+namespace ReadbackUse {
+struct Window {
+    u64 readbacks{};
+    u64 useless{};
+    u64 bytes{};
+    u64 changed{};
+    bool hot{};
+};
+std::unordered_map<VAddr, Window> windows;
+u64 total{}, useless{}, bytes{}, changed{}, hot_total{}, hot_useless{};
+std::chrono::steady_clock::time_point last_report{};
+std::vector<u8> scratch;
+
+/// Changed bytes of [addr, addr + size) if `src` were written there
+u64 Compare(Core::MemoryManager* memory, VAddr addr, const u8* src, u64 size) {
+    scratch.resize(size);
+    if (!memory->TryReadBacking(addr, scratch.data(), size)) {
+        return size;
+    }
+    u64 diff = 0;
+    for (u64 i = 0; i < size; i += 64) {
+        const u64 n = std::min<u64>(64, size - i);
+        if (std::memcmp(scratch.data() + i, src + i, n) != 0) {
+            for (u64 j = 0; j < n; ++j) {
+                diff += scratch[i + j] != src[i + j];
+            }
+        }
+    }
+    return diff;
+}
+
+void Record(VAddr request, u64 run_bytes, u64 run_changed, bool hot) {
+    auto& w = windows[request >> 16];
+    ++w.readbacks;
+    w.useless += run_changed == 0;
+    w.bytes += run_bytes;
+    w.changed += run_changed;
+    w.hot |= hot;
+    ++(hot ? hot_total : total);
+    if (run_changed == 0) {
+        ++(hot ? hot_useless : useless);
+    }
+    bytes += run_bytes;
+    changed += run_changed;
+    const auto now = std::chrono::steady_clock::now();
+    if (last_report == std::chrono::steady_clock::time_point{}) {
+        last_report = now;
+    }
+    if (now - last_report < std::chrono::seconds{10}) {
+        return;
+    }
+    last_report = now;
+    std::vector<std::pair<VAddr, Window>> top(windows.begin(), windows.end());
+    std::ranges::sort(top, [](const auto& a, const auto& b) {
+        return a.second.readbacks > b.second.readbacks;
+    });
+    std::string list;
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 10); ++i) {
+        const auto& [key, win] = top[i];
+        list += fmt::format(" {:#x}{}:{}/{}useless,{}KB,{}KBchg", key << 16, win.hot ? "h" : "",
+                            win.readbacks, win.useless, win.bytes >> 10, win.changed >> 10);
+    }
+    LOG_WARNING(Render,
+                "Readback use: guest/cp {} ({} with nothing new), hot {} ({} with nothing new), "
+                "{} KB read, {} KB changed, {} windows; top:{}",
+                total, useless, hot_total, hot_useless, bytes >> 10, changed >> 10,
+                windows.size(), list);
+    windows.clear();
+    total = useless = bytes = changed = hot_total = hot_useless = 0;
+}
+} // namespace ReadbackUse
 
 static void ReportHeapGuardHit(VAddr addr, u64 bytes) {
     // Only the GPU command processor thread downloads memory
@@ -403,11 +481,17 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             heap_guard.reset();
         }
     }
+    const bool measure_use = Common::PerfStats::Enabled();
+    u64 use_bytes = 0, use_changed = 0;
     for (const auto& copy : copies) {
         const VAddr copy_addr = arena_base + copy.srcOffset;
         const u8* src = download.mapped + (copy.dstOffset - download.offset);
         // A page can become a stack while the GPU drains: subtract the stacks again
         for (const auto& [lo, len] : memory->SubtractStackRanges(copy_addr, copy.size)) {
+            if (measure_use) {
+                use_bytes += len;
+                use_changed += ReadbackUse::Compare(memory, lo, src + (lo - copy_addr), len);
+            }
             Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::BufferReadback,
                                               lo, len, src + (lo - copy_addr), device_addr);
             if (heap_guard) {
@@ -421,6 +505,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             }
             memory->TryWriteBacking(std::bit_cast<u8*>(lo), src + (lo - copy_addr), len);
         }
+    }
+    if (measure_use) {
+        ReadbackUse::Record(device_addr, use_bytes, use_changed, false);
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
     if (!hot_downloads.empty()) {
@@ -559,14 +646,20 @@ void BufferCache::ApplyHotDownloads(BpeHeapGuard* heap_guard) {
     if (hot_total != 0) {
         hot_buffer->Invalidate(0, hot_total);
     }
+    const bool measure_use = Common::PerfStats::Enabled();
     for (const auto& item : hot_downloads) {
         const VAddr arena_base = item.arena->cpu_addr;
+        u64 use_bytes = 0, use_changed = 0;
         for (u32 i = item.first_copy; i < item.first_copy + item.num_copies; ++i) {
             const auto& copy = hot_copies[i];
             const VAddr copy_addr = arena_base + copy.srcOffset;
             const u8* src = hot_buffer->mapped_data.data() + copy.dstOffset;
             // A page can become a stack while the GPU drains: subtract the stacks again
             for (const auto& [lo, len] : memory->SubtractStackRanges(copy_addr, copy.size)) {
+                if (measure_use) {
+                    use_bytes += len;
+                    use_changed += ReadbackUse::Compare(memory, lo, src + (lo - copy_addr), len);
+                }
                 Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::BufferReadback,
                                                   lo, len, src + (lo - copy_addr), item.addr);
                 if (heap_guard) {
@@ -584,6 +677,9 @@ void BufferCache::ApplyHotDownloads(BpeHeapGuard* heap_guard) {
         }
         if (item.num_copies != 0) {
             Common::PerfStats::Add(Common::PerfStats::Id::ReadbackHotRegions);
+            if (measure_use) {
+                ReadbackUse::Record(item.addr, use_bytes, use_changed, true);
+            }
         }
         memory_tracker->UnmarkRegionAsGpuModified(item.addr, item.size, false);
     }
