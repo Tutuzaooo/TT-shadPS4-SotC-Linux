@@ -157,6 +157,10 @@ public:
 
     s32 Wait(bool can_block, s32 need_count, u32* timeout) {
         std::unique_lock lk{mutex};
+        if (deleted) {
+            // The semaphore was found before another thread deleted it; no future signal can wake this wait
+            return ORBIS_KERNEL_ERROR_ESRCH;
+        }
         if (token_count >= need_count) {
             token_count -= need_count;
             return ORBIS_OK;
@@ -220,6 +224,7 @@ public:
 
     void Delete() {
         std::scoped_lock lk{mutex};
+        deleted = true;
         for (auto* waiter : wait_list) {
             waiter->was_deleted = true;
             waiter->sem.release();
@@ -307,11 +312,20 @@ public:
     s32 max_count;
     s32 init_count;
     bool is_fifo;
+    bool deleted{};
 };
 
 using OrbisKernelSema = Common::SlotId;
 
-static Common::SlotVector<std::unique_ptr<OrbisSem>> orbis_sems;
+// Hold a reference for each semaphore call because guest threads can create, use and delete concurrently; deletion must not free a mutex a
+// waking waiter still needs
+static std::mutex orbis_sems_mutex;
+static Common::SlotVector<std::shared_ptr<OrbisSem>> orbis_sems;
+
+static std::shared_ptr<OrbisSem> FindSema(OrbisKernelSema sem) {
+    std::scoped_lock lk{orbis_sems_mutex};
+    return orbis_sems.is_allocated(sem) ? orbis_sems[sem] : nullptr;
+}
 
 s32 PS4_SYSV_ABI sceKernelCreateSema(OrbisKernelSema* sem, const char* pName, u32 attr,
                                      s32 initCount, s32 maxCount, const void* pOptParam) {
@@ -319,48 +333,63 @@ s32 PS4_SYSV_ABI sceKernelCreateSema(OrbisKernelSema* sem, const char* pName, u3
         LOG_ERROR(Lib_Kernel, "Semaphore creation parameters are invalid!");
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    *sem = orbis_sems.insert(
-        std::move(std::make_unique<OrbisSem>(initCount, maxCount, pName, attr == 1)));
+    auto new_sem = std::make_shared<OrbisSem>(initCount, maxCount, pName, attr == 1);
+    OrbisKernelSema id;
+    {
+        std::scoped_lock lk{orbis_sems_mutex};
+        id = orbis_sems.insert(std::move(new_sem));
+    }
+    *sem = id;
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceKernelWaitSema(OrbisKernelSema sem, s32 needCount, u32* pTimeout) {
-    if (!orbis_sems.is_allocated(sem)) {
+    const auto s = FindSema(sem);
+    if (!s) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    return orbis_sems[sem]->Wait(true, needCount, pTimeout);
+    return s->Wait(true, needCount, pTimeout);
 }
 
 s32 PS4_SYSV_ABI sceKernelSignalSema(OrbisKernelSema sem, s32 signalCount) {
-    if (!orbis_sems.is_allocated(sem)) {
+    const auto s = FindSema(sem);
+    if (!s) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    if (!orbis_sems[sem]->Signal(signalCount)) {
+    if (!s->Signal(signalCount)) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceKernelPollSema(OrbisKernelSema sem, s32 needCount) {
-    if (!orbis_sems.is_allocated(sem)) {
+    const auto s = FindSema(sem);
+    if (!s) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    return orbis_sems[sem]->Wait(false, needCount, nullptr);
+    return s->Wait(false, needCount, nullptr);
 }
 
 s32 PS4_SYSV_ABI sceKernelCancelSema(OrbisKernelSema sem, s32 setCount, s32* pNumWaitThreads) {
-    if (!orbis_sems.is_allocated(sem)) {
+    const auto s = FindSema(sem);
+    if (!s) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
-    return orbis_sems[sem]->Cancel(setCount, pNumWaitThreads);
+    return s->Cancel(setCount, pNumWaitThreads);
 }
 
 s32 PS4_SYSV_ABI sceKernelDeleteSema(OrbisKernelSema sem) {
-    if (!orbis_sems.is_allocated(sem)) {
-        return ORBIS_KERNEL_ERROR_ESRCH;
+    std::shared_ptr<OrbisSem> s;
+    {
+        std::scoped_lock lk{orbis_sems_mutex};
+        if (!orbis_sems.is_allocated(sem)) {
+            return ORBIS_KERNEL_ERROR_ESRCH;
+        }
+        s = std::move(orbis_sems[sem]);
+        orbis_sems.erase(sem);
     }
-    orbis_sems[sem]->Delete();
-    orbis_sems.erase(sem);
+    // Wake waiters with EACCES and free the semaphore when the last reference is released
+    s->Delete();
     return ORBIS_OK;
 }
 
