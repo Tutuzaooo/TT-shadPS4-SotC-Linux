@@ -3457,6 +3457,10 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         // The journal copies up to 16 bytes of data
         const u32 pattern[4] = {value, value, value, value};
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
+            // Upload old bytes before overwriting a range used since the last flush, as WRITE_DATA and DUMP_CONST_RAM do
+            if (buffer_cache.IsRegionInSyncBatch(address, num_bytes)) {
+                buffer_cache.FlushSyncBatch();
+            }
             Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::FillCpu, address,
                                               num_bytes, pattern, value);
             u32* buffer = std::bit_cast<u32*>(address);
