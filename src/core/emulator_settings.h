@@ -621,6 +621,9 @@ struct GPUSettings {
     // draw_pipe_steps moves extra work to the recording thread in order; bit 1 handles EOP, EOS and RELEASE_MEM fences using pending CP
     // values; ignore other bits
     Setting<u32> draw_pipe_steps{0};
+    // With draw_pipe, copy read-only V#s up to 16 KiB into a 128 MiB ring on the command processor so stage B only binds them; require no
+    // GPU-modified pages or pending writes; SHADPS4_CONSTANT_RING_VERIFY=1 compares against guest memory at bind time
+    Setting<bool> constant_ring{false};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -723,6 +726,7 @@ struct GPUSettings {
             make_override<GPUSettings>("replicate_fill_hle", &GPUSettings::replicate_fill_hle),
             make_override<GPUSettings>("draw_pipe", &GPUSettings::draw_pipe),
             make_override<GPUSettings>("draw_pipe_steps", &GPUSettings::draw_pipe_steps),
+            make_override<GPUSettings>("constant_ring", &GPUSettings::constant_ring),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -748,7 +752,7 @@ struct GPUSettings {
         access_bitmap_tracking, page_spin_locks, range_fast_paths, unbounded_vsharp_cap_mb,         \
         texture_gc_full_scan, texture_gc_trigger_mb, image_pool_texture_max_kb,                     \
         arena_evict_idle_s, render_state_memo, replicate_fill_hle, draw_pipe, draw_pipe_steps,      \
-        dlss_nr_enabled, dlss_nr_style, dlss_nr_intensity, dlss_nr_ui_correction))
+        constant_ring, dlss_nr_enabled, dlss_nr_style, dlss_nr_intensity, dlss_nr_ui_correction))
 template <typename BasicJsonType,
           nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
 void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
@@ -1105,6 +1109,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReplicateFillHle, replicate_fill_hle)
     SETTING_FORWARD_BOOL(m_gpu, DrawPipe, draw_pipe)
     SETTING_FORWARD(m_gpu, DrawPipeSteps, draw_pipe_steps)
+    SETTING_FORWARD_BOOL(m_gpu, ConstantRing, constant_ring)
     // Keep srt_walker_clean_reads and readback_ahead disabled while draw_pipe runs without changing saved settings; clean reads interfere
     // with pending-write tracking, and readback_ahead caused flicker; the rasterizer logs this
     bool IsSrtWalkerCleanReadsOn() const {

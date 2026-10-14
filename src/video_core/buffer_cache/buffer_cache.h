@@ -48,9 +48,11 @@ class BufferCache {
     static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
     static constexpr u64 NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - ARENA_PAGE_BITS);
     static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
-    static constexpr u64 STREAM_THRESHOLD = 16_KB;
 
 public:
+    /// Copy read-only bindings up to this limit through the stream buffer or constant_ring rather than binding the arena
+    static constexpr u64 STREAM_THRESHOLD = 16_KB;
+
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
                          TextureCache& texture_cache, PageManager& tracker);
@@ -134,6 +136,10 @@ public:
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+
+    /// Check GPU-modified page bits without locking while the recording thread runs; pending sync-batch writes stay tracked until a flush
+    /// marks them
+    [[nodiscard]] bool IsRegionGpuModifiedTrackedAnyThread(VAddr addr, u64 size);
 
     /// Byte-precise: true when a written binding covered any byte of the range since its last readback.
     /// Readbacks copy only these bytes, so the backing already holds the value of every other byte.

@@ -17,9 +17,9 @@ namespace Vulkan {
 
 class Pipeline;
 
-/// Transfer stage A's draw or dispatch state to stage B for binding and recording; use 8-byte aligned sections for Header, block indices,
-/// register words, each Stage with its user data and flat data, a dispatch's ComputeProgram, and the full register file when verify is
-/// enabled
+/// Transfer stage A's draw or dispatch state to stage B for binding and recording; 8-byte aligned sections contain Header, block indices,
+/// register words, each Stage with user data, flat data and optional RingBindings, a dispatch's ComputeProgram, and the full register file
+/// when verify is enabled
 namespace DrawPacket {
 
 enum class Kind : u8 {
@@ -68,6 +68,8 @@ struct Header {
     VAddr count_address;
     u32 stride;
     u32 max_count;
+    /// End offset of built packets' constant-ring allocations; stage B stamps it with the recording submission's tick
+    u64 ring_end;
 };
 
 /// A task packet starts with size and kind at Header's offsets, followed by a trivially copyable callable copied as bytes
@@ -82,6 +84,15 @@ struct Stage {
     VAddr pgm_base;
     u32 ud_size;
     u32 flat_size;
+    u32 num_ring; ///< constant_ring RingBindings follow the data words
+};
+
+/// A stage's buffer copied into constant_ring by stage A, in descriptor order
+struct RingBinding {
+    u32 desc_index; ///< Index into Shader::Info::buffers
+    u32 size;
+    u64 offset; ///< Byte offset in the ring
+    VAddr address;
 };
 
 constexpr u32 Align(u32 size) {

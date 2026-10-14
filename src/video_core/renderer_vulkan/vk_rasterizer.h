@@ -9,6 +9,7 @@
 #include <cstring>
 #include <deque>
 #include <new>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 
@@ -18,6 +19,7 @@
 #include "video_core/mapped_page_table.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bind_cache.h"
+#include "video_core/renderer_vulkan/vk_constant_ring.h"
 #include "video_core/renderer_vulkan/vk_draw_packet.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
@@ -255,6 +257,12 @@ private:
     void AddNetRange(VAddr addr, u64 size, u64 packet, bool cpu);
     /// Remove finished ranges and clear their page bits once no pending range remains
     void PruneNet();
+    /// After CollectNetRanges on stage A, copy eligible small read-only bindings into the ring and save them in ring_collect[stage_index]
+    void CollectRingBindings(const Shader::Info& stage, u32 stage_index);
+    /// Read this stage's packet RingBindings in descriptor order on stage B; empty when none were copied
+    std::span<const DrawPacket::RingBinding> RingBindings(const Shader::Info& stage) const;
+    /// At bind time, verify stage A's copied bytes against guest memory and check writes since the last readback
+    void VerifyRingBinding(const Shader::Info& stage, const DrawPacket::RingBinding& ring);
     /// Guest syncs queued while the recording thread had pending packets
     void ApplyPendingGameSync();
     /// SHADPS4_PIPE_VERIFY=N checks captured registers every N packets; inline checks also compare extents, compute state and user data
@@ -581,8 +589,27 @@ private:
     const u32 pipe_steps;        ///< Configured draw_pipe_steps bits
     /// Follow SHADPS4_AB_TOGGLE for bit 1 through the pipe_fences pseudo-key
     const bool pipe_fences_toggle;
-    // The ring and the draw recording thread (null without the key); last, so the thread stops
-    // before anything it uses goes away
+    // Store the constant ring, A/B and verification settings, per-stage collected bindings and stage B's active bindings and read flag;
+    // requires draw_pipe and pending-write tracking; declare before draw_pipe so its thread stops before the ring is destroyed
+    std::unique_ptr<ConstantRing> constant_ring;
+    const bool constant_ring_toggle;
+    bool constant_ring_verify{};
+    std::array<std::vector<DrawPacket::RingBinding>, Shader::Info::MaxUdSnapshots> ring_collect;
+    struct RingStage {
+        const Shader::Info* info;
+        const DrawPacket::RingBinding* bindings;
+        u32 count;
+    };
+    std::array<RingStage, Shader::Info::MaxUdSnapshots> ring_stages{};
+    u32 num_ring_stages{};
+    bool ring_bound{};
+    u64 ring_verify_checks{};
+    u64 ring_verify_mismatches{};
+    std::vector<u8> ring_verify_bytes;
+    /// Keep a host shadow for verification; reading device-local ring memory cut a fork run from 50 to 4.5 fps
+    std::unique_ptr<u8[]> ring_verify_shadow;
+    std::chrono::steady_clock::time_point ring_verify_last_report{};
+    // Declare the packet ring and recording thread last so the thread stops before its dependencies are destroyed
     std::unique_ptr<DrawPipe> draw_pipe;
 };
 

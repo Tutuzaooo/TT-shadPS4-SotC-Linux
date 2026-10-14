@@ -241,6 +241,16 @@ enum class Id : u32 {
     PipeVerifyMismatches,
     PipeTasks,
     PipeFenceWaits,
+    // Count stage A's constant-ring copies, bytes and time, fallbacks for busy or GPU-written ranges, and verification checks and
+    // mismatches at bind time
+    RingBinds,
+    RingBytes,
+    RingCopyNs,
+    RingFull,
+    RingSkipGpu,
+    RingSkipNet,
+    RingVerifyChecks,
+    RingVerifyMismatches,
     Count,
 };
 

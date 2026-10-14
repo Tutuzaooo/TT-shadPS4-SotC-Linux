@@ -32,6 +32,25 @@ public:
         });
     }
 
+    /// Check from any thread whether any page is GPU-modified without taking region locks
+    bool IsRegionGpuModifiedAnyThread(VAddr cpu_addr, u64 size) noexcept {
+        u64 remaining_size = size;
+        u64 page_index = cpu_addr >> HIGHER_PAGE_BITS;
+        u64 page_offset = cpu_addr & HIGHER_PAGE_MASK;
+        while (remaining_size > 0) {
+            const u64 amount = std::min(HIGHER_PAGE_SIZE - page_offset, remaining_size);
+            auto* region = std::atomic_ref<RegionManager*>{top_tier[page_index]}.load(
+                std::memory_order_acquire);
+            if (region && region->template IsRegionModified<Type::GPU>(page_offset, amount)) {
+                return true;
+            }
+            ++page_index;
+            page_offset = 0;
+            remaining_size -= amount;
+        }
+        return false;
+    }
+
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr cpu_addr, u64 size) noexcept {
         return IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
@@ -193,7 +212,7 @@ private:
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
         free_managers.pop_back();
-        // Publish with release ordering so guest faults can read the table without the owner's locks
+        // Publish with release ordering for guest faults and IsRegionGpuModifiedAnyThread's lock-free table reads
         std::atomic_ref<RegionManager*>{top_tier[page_index]}.store(new_manager,
                                                                      std::memory_order_release);
         return new_manager;

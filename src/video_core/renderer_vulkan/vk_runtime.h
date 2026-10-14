@@ -77,6 +77,12 @@ public:
     bool IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                           bool check_read_access = false);
 
+    /// Track a read-only constant-ring access for barriers and gcn_unordered_dispatches without adding a written range
+    void AccessReadOnly(vk::PipelineStageFlags2 src_stage, bool game_dispatch) {
+        memory_barrier.srcStageMask |= src_stage;
+        foreign_access |= !game_dispatch;
+    }
+
     /// Flush image barriers and the buffer accesses tracked since the last barrier
     /// For unordered_ring, skip the memory barrier only without image
     /// barriers, DMA or guest sync

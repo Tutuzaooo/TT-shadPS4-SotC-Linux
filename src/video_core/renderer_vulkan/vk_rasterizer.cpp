@@ -543,7 +543,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                   Shader::GetSrtWalkerContext()->clean_pages != nullptr},
       draw_pipe_toggle{Common::PerfStats::AbToggleFollows("draw_pipe")},
       pipe_steps{EmulatorSettings.GetDrawPipeSteps()},
-      pipe_fences_toggle{Common::PerfStats::AbToggleFollows("pipe_fences")} {
+      pipe_fences_toggle{Common::PerfStats::AbToggleFollows("pipe_fences")},
+      constant_ring_toggle{Common::PerfStats::AbToggleFollows("constant_ring")} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -681,6 +682,25 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                         unknown);
         }
     }
+    // Stage A's ring copies require pending-write tracking so they cannot read ahead of a writer; without draw_pipe, copies stay on the
+    // same thread
+    if (EmulatorSettings.IsConstantRing() || Common::PerfStats::AbToggleLists("constant_ring")) {
+        if (!draw_pipe) {
+            LOG_WARNING(Render_Vulkan, "Workaround constant_ring ignored: it needs draw_pipe");
+        } else if (!net_enabled) {
+            LOG_WARNING(Render_Vulkan, "Workaround constant_ring ignored: it needs the draw_pipe "
+                                       "safety net (no clean-page bitmap)");
+        } else {
+            constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
+            constant_ring_verify = std::getenv("SHADPS4_CONSTANT_RING_VERIFY") != nullptr;
+            if (constant_ring_verify) {
+                ring_verify_shadow = std::make_unique_for_overwrite<u8[]>(ConstantRing::Capacity);
+            }
+            LOG_WARNING(Render_Vulkan, "Workaround constant_ring enabled{}: {} MiB{}",
+                        EmulatorSettings.IsConstantRing() ? "" : " (A/B toggle only)",
+                        ConstantRing::Capacity >> 20, constant_ring_verify ? " (verify)" : "");
+        }
+    }
 }
 
 Rasterizer::~Rasterizer() {
@@ -786,6 +806,9 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
         const Common::PerfStats::ScopedNs net_timer{Common::PerfStats::Id::PipeNetNs};
         CollectNetRanges(pipeline);
     }
+    // Collect ring bindings only for stage B packets and after output ranges are tracked, excluding reads that overlap this packet's writes
+    const bool packet_ring =
+        in_pipe && constant_ring && pipeline && Common::PerfStats::AbToggleOn(constant_ring_toggle);
     // Decide here whether verification needs the full register file on stage B
     const bool verify =
         pipe_verify_interval != 0 && ++pipe_verify_packets % pipe_verify_interval == 0;
@@ -798,14 +821,19 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     if (pipeline) {
         for (const auto* stage : pipeline->GetStages()) {
             if (stage) {
+                ASSERT(num_stages < Shader::Info::MaxUdSnapshots);
                 const auto words = stage->user_data.size() + stage->flattened_ud_buf.size();
                 size +=
                     Align(sizeof(DrawPacket::Stage)) + Align(static_cast<u32>(words * sizeof(u32)));
+                if (packet_ring) {
+                    CollectRingBindings(*stage, num_stages);
+                    size += Align(static_cast<u32>(ring_collect[num_stages].size() *
+                                                   sizeof(DrawPacket::RingBinding)));
+                }
                 ++num_stages;
             }
         }
     }
-    ASSERT(num_stages <= Shader::Info::MaxUdSnapshots);
     if (has_cs) {
         size += Align(sizeof(AmdGpu::ComputeProgram));
     }
@@ -839,6 +867,7 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     packet.pipeline = pipeline;
     packet.cb_extent = liverpool->last_cb_extent;
     packet.db_extent = liverpool->last_db_extent;
+    packet.ring_end = constant_ring ? constant_ring->Position() : 0;
     u8* out = data + Align(sizeof(DrawPacket::Header));
     const u16* blocks = dirty.Blocks();
     std::memcpy(out, blocks, num_blocks * sizeof(u16));
@@ -850,15 +879,18 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     }
     dirty.Clear();
     if (pipeline) {
+        u32 stage_index = 0;
         for (const auto* stage : pipeline->GetStages()) {
             if (!stage) {
                 continue;
             }
+            const auto& ring = ring_collect[stage_index++];
             const DrawPacket::Stage header = {
                 .info = stage,
                 .pgm_base = stage->pgm_base,
                 .ud_size = static_cast<u32>(stage->user_data.size()),
                 .flat_size = static_cast<u32>(stage->flattened_ud_buf.size()),
+                .num_ring = packet_ring ? static_cast<u32>(ring.size()) : 0U,
             };
             std::memcpy(out, &header, sizeof(header));
             out += Align(sizeof(DrawPacket::Stage));
@@ -866,6 +898,12 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
             std::memcpy(out + header.ud_size * sizeof(u32), stage->flattened_ud_buf.data(),
                         header.flat_size * sizeof(u32));
             out += Align((header.ud_size + header.flat_size) * sizeof(u32));
+            if (header.num_ring != 0) {
+                const u32 ring_bytes =
+                    static_cast<u32>(header.num_ring * sizeof(DrawPacket::RingBinding));
+                std::memcpy(out, ring.data(), ring_bytes);
+                out += Align(ring_bytes);
+            }
         }
     }
     if (has_cs) {
@@ -968,6 +1006,121 @@ void Rasterizer::PipeNetLoad(VAddr addr, u32 size) {
     }
 }
 
+void Rasterizer::CollectRingBindings(const Shader::Info& stage, u32 stage_index) {
+    using Common::PerfStats::Id;
+    auto& out = ring_collect[stage_index];
+    out.clear();
+    const u64 start = Common::PerfStats::Enabled() ? Common::PerfStats::Detail::Ticks() : 0;
+    // Align for both descriptor types so BindBuffers can use the offset directly
+    const u64 alignment =
+        std::max<u64>(instance.StorageMinAlignment(), instance.UniformMinAlignment());
+    const Shader::UdView ud{stage};
+    for (u32 index = 0; index < stage.buffers.size(); ++index) {
+        const auto& desc = stage.buffers[index];
+        if (desc.is_written || desc.IsSpecial()) {
+            continue;
+        }
+        // Match ObtainBuffer's stream-copy path: read-only V#s no larger than STREAM_THRESHOLD after clamping; leave unbounded V#s on that
+        // path
+        const auto vsharp = desc.GetSharp(ud);
+        if (vsharp.base_address <= 1 || vsharp.GetSize() == 0 ||
+            vsharp.num_records == 0xffffffffu || !IsMapped(vsharp.base_address, 1)) {
+            continue;
+        }
+        const VAddr addr = vsharp.base_address;
+        const u64 size = memory->ClampRangeSize(addr, vsharp.GetSize());
+        if (size == 0 || size > VideoCore::BufferCache::STREAM_THRESHOLD) {
+            continue;
+        }
+        // Check pending writes before page marks; a completed flush has marked its pages by the second check, while reversing the checks
+        // could miss a concurrent flush
+        if (std::ranges::any_of(net_pending, [&](const NetRange& range) {
+                return addr < range.addr + range.size && range.addr < addr + size &&
+                       !NetRangeDone(range);
+            })) {
+            Common::PerfStats::Add(Id::RingSkipNet);
+            continue;
+        }
+        // Bind the arena for GPU-modified pages because guest memory may be stale
+        if (buffer_cache.IsRegionGpuModifiedTrackedAnyThread(addr, size)) {
+            Common::PerfStats::Add(Id::RingSkipGpu);
+            continue;
+        }
+        const auto offset = constant_ring->Allocate(size, alignment);
+        if (!offset) {
+            Common::PerfStats::Add(Id::RingFull);
+            continue;
+        }
+        if (ring_verify_shadow) {
+            // Copy shadow bytes into the ring so verification checks the bytes the GPU actually reads
+            memory->CopySparseMemory(addr, ring_verify_shadow.get() + *offset, size);
+            std::memcpy(constant_ring->Data(*offset), ring_verify_shadow.get() + *offset, size);
+        } else {
+            memory->CopySparseMemory(addr, constant_ring->Data(*offset), size);
+        }
+        constant_ring->Flush(*offset, size);
+        out.push_back({index, static_cast<u32>(size), *offset, addr});
+        Common::PerfStats::Add(Id::RingBinds);
+        Common::PerfStats::Add(Id::RingBytes, size);
+    }
+    if (start != 0) {
+        Common::PerfStats::Add(Id::RingCopyNs, Common::PerfStats::Detail::TicksToNs(
+                                                   Common::PerfStats::Detail::Ticks() - start));
+    }
+}
+
+std::span<const DrawPacket::RingBinding> Rasterizer::RingBindings(const Shader::Info& stage) const {
+    for (u32 i = 0; i < num_ring_stages; ++i) {
+        if (ring_stages[i].info == &stage) {
+            return {ring_stages[i].bindings, ring_stages[i].count};
+        }
+    }
+    return {};
+}
+
+void Rasterizer::VerifyRingBinding(const Shader::Info& stage, const DrawPacket::RingBinding& ring) {
+    // Compare with bytes the stream path would copy now; also check writes since the last readback, since both guest-memory copies may
+    // otherwise be equally stale
+    using Common::PerfStats::Id;
+    ring_verify_bytes.resize(ring.size);
+    memory->CopySparseMemory(ring.address, ring_verify_bytes.data(), ring.size);
+    const u8* copied = ring_verify_shadow.get() + ring.offset;
+    const bool gpu_written = buffer_cache.IsRangeGpuWritten(ring.address, ring.size);
+    const bool differs = std::memcmp(copied, ring_verify_bytes.data(), ring.size) != 0;
+    ++ring_verify_checks;
+    Common::PerfStats::Add(Id::RingVerifyChecks);
+    if (differs || gpu_written) {
+        ++ring_verify_mismatches;
+        Common::PerfStats::Add(Id::RingVerifyMismatches);
+        if (ring_verify_mismatches <= 32) {
+            u32 first = 0;
+            while (first < ring.size && copied[first] == ring_verify_bytes[first]) {
+                ++first;
+            }
+            u32 differing = 0;
+            for (u32 i = 0; i < ring.size; ++i) {
+                differing += copied[i] != ring_verify_bytes[i];
+            }
+            LOG_ERROR(
+                Render_Vulkan,
+                "constant_ring verify: shader {:#x} buffer {} at {:#x}+{:#x}: {} bytes differ "
+                "from guest memory (first at {:#x}), GPU-written {} (pages GPU-modified {}, "
+                "CPU-modified {})",
+                stage.pgm_hash, ring.desc_index, ring.address, ring.size, differing, first,
+                gpu_written, buffer_cache.IsRegionGpuModified(ring.address, ring.size),
+                buffer_cache.IsRegionCpuModified(ring.address, ring.size));
+        }
+    }
+    if (ring_verify_checks == 1 || ring_verify_checks % 4096 == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (ring_verify_checks == 1 || now - ring_verify_last_report >= std::chrono::minutes{1}) {
+            LOG_WARNING(Render_Vulkan, "constant_ring verify: {} bindings checked, {} mismatches",
+                        ring_verify_checks, ring_verify_mismatches);
+            ring_verify_last_report = now;
+        }
+    }
+}
+
 u8* Rasterizer::BeginTask(u32 size, void (*run)(const void* task)) {
     using DrawPacket::Align;
     // Ring tasks order later packets behind them; BuildPacket drains when switching to inline recording
@@ -1025,6 +1178,11 @@ void Rasterizer::RunPacket(const u8* data) {
                                          stage.ud_size,   words + stage.ud_size,
                                          stage.flat_size, stage.pgm_base};
         in += Align((stage.ud_size + stage.flat_size) * sizeof(u32));
+        if (stage.num_ring != 0) {
+            ring_stages[num_ring_stages++] = {
+                stage.info, reinterpret_cast<const DrawPacket::RingBinding*>(in), stage.num_ring};
+            in += Align(static_cast<u32>(stage.num_ring * sizeof(DrawPacket::RingBinding)));
+        }
     }
     Shader::Info::num_ud_snapshots = packet.num_stages;
     const AmdGpu::ComputeProgram* cs = nullptr;
@@ -1083,6 +1241,11 @@ void Rasterizer::RunPacket(const u8* data) {
     case DrawPacket::Kind::Task:
         // Run before the packet body
         break;
+    }
+    num_ring_stages = 0;
+    if (constant_ring) {
+        // Stamp all recorded ring bindings and publish tick changes even for packets without ring allocations
+        constant_ring->Stamp(packet.ring_end);
     }
     Shader::Info::num_ud_snapshots = 0;
     stage_regs = nullptr;
@@ -2173,14 +2336,19 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
+    const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
+                                      : vk::PipelineStageFlagBits2::eAllGraphics;
     for (const auto [buffer, offset, size, is_written] : bound_buffers) {
-        const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
-                                          : vk::PipelineStageFlagBits2::eAllGraphics;
         const auto write_flag =
             is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone;
         runtime.AccessBuffer(buffer, offset, size, dst_stage,
                              vk::AccessFlagBits2::eShaderRead | write_flag,
                              is_compute && game_dispatch_accesses);
+    }
+    if (ring_bound) {
+        // Record ring reads for later barriers and gcn_unordered_dispatches, as stream-buffer bindings do
+        runtime.AccessReadOnly(dst_stage, is_compute && game_dispatch_accesses);
+        ring_bound = false;
     }
     unordered_ring = -1;
     game_dispatch_accesses = false;
@@ -2444,6 +2612,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
     const Shader::UdView ud{stage};
+    // Ring bindings copied for this stage, in descriptor order
+    auto ring =
+        num_ring_stages != 0 ? RingBindings(stage) : std::span<const DrawPacket::RingBinding>{};
     for (const auto& desc : stage.buffers) {
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
@@ -2500,6 +2671,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else {
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
+        } else if (!ring.empty() &&
+                   ring.front().desc_index == static_cast<u32>(&desc - stage.buffers.data())) {
+            // Bind the aligned constant-ring copy before checking incremental_bind reuse and leave its slot empty like a stream copy;
+            // ResetBindings tracks the read for barriers
+            if (bind_cache) {
+                bind_cache->Buffer(bind_cache_buffer_index++).arena = nullptr;
+            }
+            if (constant_ring_verify) {
+                VerifyRingBinding(stage, ring.front());
+            }
+            push_data.AddOffset(binding.buffer, 0);
+            buffer_infos.emplace_back(constant_ring->Handle(), ring.front().offset,
+                                      ring.front().size);
+            ring_bound = true;
+            ring = ring.subspan(1);
         } else {
             const auto vsharp = desc.GetSharp(ud);
             const auto bind_range = [&](const VideoCore::Buffer* buffer, u64 offset, u64 size) {
