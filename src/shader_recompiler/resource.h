@@ -259,7 +259,10 @@ struct FMaskResource {
     SharpLocation sharp_idx;
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
-        return info.template ReadUdSharp<AmdGpu::Image>(sharp_idx);
+        // Table-element T#s have no flat buffer location
+        return sharp_idx == UNKNOWN_LOCATION
+                   ? AmdGpu::Image::Null(false)
+                   : info.template ReadUdSharp<AmdGpu::Image>(sharp_idx);
     }
 };
 using FMaskResourceList = boost::container::static_vector<FMaskResource, NUM_FMASKS>;
