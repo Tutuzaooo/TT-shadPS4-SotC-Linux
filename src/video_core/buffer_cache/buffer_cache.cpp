@@ -438,15 +438,17 @@ bool BufferCache::TouchHotReadback(VAddr addr, u64 size) {
     const auto now = std::chrono::steady_clock::now();
     for (auto& hot : hot_readbacks) {
         if (hot.addr == addr && hot.size == size) {
+            // A window read again after a long pause starts over
+            hot.hits = now - hot.last_request > std::chrono::seconds(2) ? 1 : hot.hits + 1;
             hot.last_request = now;
             return true;
         }
     }
     if (hot_readbacks.size() < MaxHotReadbacks) {
-        hot_readbacks.push_back({addr, size, now});
+        hot_readbacks.push_back({addr, size, now, 1});
     } else {
         *std::ranges::min_element(hot_readbacks, {}, &HotReadback::last_request) = {addr, size,
-                                                                                     now};
+                                                                                     now, 1};
     }
     return true;
 }
@@ -460,9 +462,27 @@ void BufferCache::RecordHotDownloads(VAddr skip_addr) {
     hot_downloads.clear();
     hot_copies.clear();
     u64 total_size_bytes = 0;
-    for (const auto& hot : hot_readbacks) {
-        if (hot.addr == skip_addr || now - hot.last_request > HotReadbackLifetime) {
+    // PINK_HOT_MIN_HITS=<n> (default 3): only windows the game read at least n times in a row
+    // come along. While a scene loads the game reads many windows once each, and bringing all of
+    // them back with every readback made each one much longer (stutters, and the textures the
+    // game streams in meanwhile arrived late: black or white for a moment). The windows it reads
+    // every frame, where the gain is, pass at once. PINK_HOT_MAX_MB=<n> (default 4) caps the bytes
+    // one readback brings along
+    static const u32 min_hits = [] {
+        const char* v = std::getenv("PINK_HOT_MIN_HITS");
+        return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 3u;
+    }();
+    static const u64 max_bytes = [] {
+        const char* v = std::getenv("PINK_HOT_MAX_MB");
+        return (v ? std::strtoull(v, nullptr, 10) : 4ull) << 20;
+    }();
+    for (auto& hot : hot_readbacks) {
+        if (hot.addr == skip_addr || now - hot.last_request > HotReadbackLifetime ||
+            hot.hits < min_hits) {
             continue;
+        }
+        if (max_bytes != 0 && total_size_bytes >= max_bytes) {
+            break;
         }
         // Bindings count as GPU-written before their command runs
         // Do not clear those pending writes in a grouped download
@@ -502,6 +522,10 @@ void BufferCache::RecordHotDownloads(VAddr skip_addr) {
         if (!gpu_modified) {
             continue;
         }
+        // Brought back, the window's next read does not fault and so does not renew it: renew it
+        // here while the GPU keeps writing it, or it would drop out after the lifetime and need
+        // min_hits faulting reads again
+        hot.last_request = now;
         // Windows the tracker marks GPU-written without GPU-written
         // bytes left are only unmarked
         const u32 num_copies = static_cast<u32>(hot_copies.size()) - first_copy;

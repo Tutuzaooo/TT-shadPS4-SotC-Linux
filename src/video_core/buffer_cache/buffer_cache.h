@@ -373,6 +373,7 @@ private:
         VAddr addr;
         u64 size;
         std::chrono::steady_clock::time_point last_request;
+        u32 hits; ///< requests in a row, each within the lifetime of the previous one
     };
     std::vector<HotReadback> hot_readbacks;
     /// readback_hot_regions: windows with copies recorded by
