@@ -271,6 +271,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     };
     if (assume_locks) {
         flush_request();
+    } else if (cp_locked_readback && cp_locked_readback()) {
+        // After draining, the command processor owns the cache and can read back inline on its locked path
+        flush_request();
     } else {
         const Common::PerfStats::ScopedNs wait_timer{Common::PerfStats::Id::GuestReadbackWaitNs};
         liverpool->SendCommand<true>(std::move(flush_request));
@@ -906,10 +909,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
 
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionCpuModified(addr, size);
-}
-
-bool BufferCache::IsRegionFullyGpuModifiedTracked(VAddr addr, u64 size) {
-    return memory_tracker->IsRegionFullyGpuModified(addr, size);
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
@@ -1565,6 +1564,10 @@ void BufferCache::FlushSyncBatch(bool from_scheduler, bool new_session) {
     }
     sync_batch.Clear();
     sync_batch_generation.fetch_add(1, std::memory_order_release);
+    // ForEachUploadRange marked and protected these writes above
+    if (on_sync_flushed) {
+        on_sync_flushed();
+    }
     dma_sync_covered = false;
     if (copies.empty()) {
         if (new_session && !from_scheduler) {

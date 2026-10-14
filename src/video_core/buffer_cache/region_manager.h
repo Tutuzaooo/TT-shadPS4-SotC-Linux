@@ -174,17 +174,6 @@ public:
         }
     }
 
-    /// Read without locking whether the whole range is modified, as in IsRegionModified
-    template <Type type>
-    bool IsRegionFullyModified(u64 offset, u64 size) noexcept {
-        auto& state = GetRegionBits<type>();
-        bool full = true;
-        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
-            full &= (state[index] & mask) == mask;
-        });
-        return full;
-    }
-
     void Lock(const Bounds& bounds) noexcept {
         mutex.lock();
     }

@@ -113,6 +113,8 @@ SrtWalkerContext& WalkerContext() {
     };
     return context;
 }
+
+void (*g_srt_net_read)(u64 address, u64 size) = nullptr;
 } // namespace
 
 const SrtWalkerContext* GetSrtWalkerContext() {
@@ -153,6 +155,25 @@ void SetSrtCleanPages(u64 address, u64 size, bool set) {
             bits[word] &= ~mask;
         }
         page += hi - lo + 1;
+    }
+}
+
+void SetSrtNetRead(void (*net_read)(u64 address, u64 size)) {
+    g_srt_net_read = net_read;
+}
+
+void SrtNetRead(u64 address, u64 size) {
+    // Test the same page bits the walker checks before calling clean_load
+    const u64* const bits = WalkerContext().clean_pages;
+    if (!bits || !g_srt_net_read || size == 0 || address >= SrtCleanPageLimit) {
+        return;
+    }
+    const u64 last = (std::min(address + size, SrtCleanPageLimit) - 1) >> 12;
+    for (u64 page = address >> 12; page <= last; ++page) {
+        if ((bits[page >> 6] >> (page & 63)) & 1) {
+            g_srt_net_read(address, size);
+            return;
+        }
     }
 }
 
@@ -1227,6 +1248,10 @@ void SetSrtCleanLoad(bool PS4_SYSV_ABI (*clean_load)(u64, u32, u64*)) {}
 void MarkSrtCleanPages(u64 address, u32 size) {}
 
 void SetSrtCleanPages(u64 address, u64 size, bool set) {}
+
+void SetSrtNetRead(void (*net_read)(u64 address, u64 size)) {}
+
+void SrtNetRead(u64 address, u64 size) {}
 
 void CompleteSrtLoad(void* context, const SrtLoad& load, u64 value) {}
 

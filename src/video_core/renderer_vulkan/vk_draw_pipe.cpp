@@ -103,6 +103,12 @@ void DrawPipe::Drain() {
     SpinUntil([this] { return Idle(); });
 }
 
+void DrawPipe::WaitPublished() {
+    // Ring offsets increase monotonically; wrap markers advance both offsets to the start
+    const u64 target = published.load(std::memory_order_acquire);
+    SpinUntil([&] { return consumed.load(std::memory_order_acquire) >= target; });
+}
+
 void DrawPipe::WaitForSpace(u64 at, u64 size) {
     // A full ring puts stage B 16 MiB behind
     SpinUntil([&] { return at + size - consumed.load(std::memory_order_acquire) <= Capacity; });

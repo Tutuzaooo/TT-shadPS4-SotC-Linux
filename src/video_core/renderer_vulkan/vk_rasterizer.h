@@ -4,8 +4,13 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <deque>
+#include <new>
+#include <type_traits>
+#include <unordered_map>
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -79,6 +84,37 @@ public:
     void DrainForCpWait(u64 cp_progress);
     /// Before an SRT load from a flagged page, wait for any pending writer of those bytes; the load can then fault and read back GPU data
     void PipeNetLoad(VAddr addr, u32 size);
+    /// Track GPU writes outside packet bindings, such as DMA_DATA and RELEASE_MEM GDS copies, until a flush after the next packet marks
+    /// them; stage A only
+    void NetPendingWrite(VAddr addr, u64 size);
+
+    /// Work selected by a draw_pipe_steps bit for the recording thread
+    enum class PipeStep : u8 {
+        Fences = 1, ///< Order EOP, EOS and RELEASE_MEM; CP waits use pending label values
+    };
+    /// Choose once per PM4 packet using the step bit, A/B pseudo-key, draw_pipe and pending-write tracking; repeated checks could see
+    /// different toggle states
+    [[nodiscard]] bool PipeStepOn(PipeStep step) const noexcept {
+        return ((pipe_steps >> static_cast<u32>(step)) & 1) != 0 && net_enabled && UsePipe() &&
+               Common::PerfStats::AbToggleOn(pipe_fences_toggle);
+    }
+    /// Run task in draw order on the recording thread when in_pipe, or drain and run here otherwise; ring tasks capture only trivially
+    /// copyable values, excluding std::function and UniqueFunction
+    template <typename F>
+    void RunInOrder(bool in_pipe, F&& task) {
+        using Task = std::decay_t<F>;
+        static_assert(std::is_trivially_copyable_v<Task> && alignof(Task) <= 8);
+        if (!in_pipe || !draw_pipe) {
+            DrainDrawPipe();
+            task();
+            return;
+        }
+        u8* bytes = BeginTask(static_cast<u32>(sizeof(Task)), [](const void* data) {
+            (*std::launder(static_cast<const Task*>(data)))();
+        });
+        std::memcpy(bytes, &task, sizeof(Task));
+        draw_pipe->Commit();
+    }
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
@@ -207,14 +243,17 @@ private:
     void SubmitPacket();
     void RunPacket(const u8* data);
     static void RunPipePacket(void* context, const u8* data, u32 size);
+    /// Reserve ring space for a task of size bytes with runner run; RunInOrder commits it
+    u8* BeginTask(u32 size, void (*run)(const void* task));
     /// Decide whether this packet uses the recording thread from draw_pipe and SHADPS4_AB_TOGGLE
     [[nodiscard]] bool UsePipe() const noexcept {
         return draw_pipe && Common::PerfStats::AbToggleOn(draw_pipe_toggle);
     }
-    /// Flag pending output ranges whose pages are not yet GPU-modified for the SRT clean-load check; keep them flagged until stage B runs
-    /// the packet
+    /// Flag packet output ranges for SRT clean-load checks until their writes are marked; see NetRangeDone
     void CollectNetRanges(const Pipeline* pipeline);
-    /// Remove completed ranges and clear page bits once no pending range remains
+    /// Add a pending range or move an existing address to a later packet
+    void AddNetRange(VAddr addr, u64 size, u64 packet, bool cpu);
+    /// Remove finished ranges and clear their page bits once no pending range remains
     void PruneNet();
     /// Guest syncs queued while the recording thread had pending packets
     void ApplyPendingGameSync();
@@ -511,15 +550,25 @@ private:
     u64 fill_verify_checks{};
     u64 fill_verify_mismatches{};
     std::chrono::steady_clock::time_point fill_verify_last_report{};
-    // Track pending output ranges in packet order, replacing repeated addresses with the newest packet number; clear completed ranges' page
-    // bits once no pending range remains; requires precise readbacks and a clean-page bitmap
+    // Track unmarked writes in packet order and the newest write at each address; clear finished ranges' bits only when no pending range
+    // shares the pages; requires precise readbacks and a clean-page bitmap
     struct NetRange {
         VAddr addr;
         u64 size;
         u64 packet;
+        /// replicate_fill_hle writes on the CPU or flushes its own GPU write within stage B
+        bool cpu;
     };
+    /// GPU writes finish tracking after a later sync flush marks and protects them; CPU writes finish when their packet runs
+    bool NetRangeDone(const NetRange& range) const noexcept {
+        return range.cpu ? draw_pipe->ReachedPacket(range.packet)
+                         : pipe_sync_flushed.load(std::memory_order_acquire) >= range.packet;
+    }
     std::deque<NetRange> net_pending;
+    std::unordered_map<VAddr, NetRange*> net_by_addr;
     std::vector<std::pair<VAddr, u64>> net_to_clear;
+    /// Packet count completed at the last sync batch flush; updated through BufferCache::on_sync_flushed on the flushing thread
+    std::atomic<u64> pipe_sync_flushed{};
     const bool net_enabled;
     u64 cp_wait_progress{~u64{0}}; ///< CP progress recorded at the last unmet wait
     // Last backing page cached by ReadCodeMemory on stage A
@@ -528,8 +577,12 @@ private:
     u64 code_page_generation{};
     /// Queue synchronized rings for stage A's next packet or drain
     u16 pending_game_sync{};
-    const bool draw_pipe_toggle; ///< Follow SHADPS4_AB_TOGGLE for draw_pipe
-    // Declare the ring and recording thread last so the thread stops before its dependencies are destroyed
+    const bool draw_pipe_toggle; ///< draw_pipe follows SHADPS4_AB_TOGGLE
+    const u32 pipe_steps;        ///< Configured draw_pipe_steps bits
+    /// Follow SHADPS4_AB_TOGGLE for bit 1 through the pipe_fences pseudo-key
+    const bool pipe_fences_toggle;
+    // The ring and the draw recording thread (null without the key); last, so the thread stops
+    // before anything it uses goes away
     std::unique_ptr<DrawPipe> draw_pipe;
 };
 

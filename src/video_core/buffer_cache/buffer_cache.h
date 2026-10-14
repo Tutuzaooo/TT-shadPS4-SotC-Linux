@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -134,9 +135,6 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
-    /// Check without locking whether all pages are GPU-modified; safe for the command processor while the recording thread runs
-    [[nodiscard]] bool IsRegionFullyGpuModifiedTracked(VAddr addr, u64 size);
-
     /// Byte-precise: true when a written binding covered any byte of the range since its last readback.
     /// Readbacks copy only these bytes, so the backing already holds the value of every other byte.
     /// Command processor thread only
@@ -208,6 +206,11 @@ public:
 
     /// Flush pending sync requests; from_scheduler ends the session, while new_session starts one even without uploads
     void FlushSyncBatch(bool from_scheduler = false, bool new_session = false);
+    /// Call after each flush marks and protects its writes, on whichever thread performs the flush
+    std::function<void()> on_sync_flushed;
+    /// A command processor readback on the locked path would queue work to itself; drain and return true to read back inline instead;
+    /// return false on other threads
+    std::function<bool()> cp_locked_readback;
 
 private:
     struct ArenaBinds {

@@ -29,6 +29,7 @@ enum class Kind : u8 {
     DrawIndirect,
     Dispatch,
     DispatchIndirect,
+    Task, ///< Run this draw_pipe_steps task in order through Rasterizer::RunInOrder
 };
 
 /// FilterDraw's result for stage B to execute
@@ -67,6 +68,13 @@ struct Header {
     VAddr count_address;
     u32 stride;
     u32 max_count;
+};
+
+/// A task packet starts with size and kind at Header's offsets, followed by a trivially copyable callable copied as bytes
+struct TaskHeader {
+    u32 size;
+    Kind kind;
+    void (*run)(const void* task);
 };
 
 struct Stage {

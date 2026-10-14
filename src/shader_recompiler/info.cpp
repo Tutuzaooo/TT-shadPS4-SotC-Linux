@@ -34,8 +34,11 @@ void Info::FillSharpTables(u32* flat, bool* count_logged) const {
         const VAddr ptr =
             (VAddr{flat[table.ptr_lo]} | VAddr{flat[table.ptr_hi]} << 32) & AddressMask;
         const VAddr src = ptr + u64{table.offset_dw} * sizeof(u32);
-        // Read only live entries through the backing under the memory manager lock; invalid pointers can hit free address space, and
-        // reading an unbacked tail would fail the whole read; CPU writes keep the backing current
+        // Read live table entries through the backing under the memory manager lock to avoid invalid pointers and unbacked tails; CPU
+        // writes keep the backing current, but wait for pending draw-pipe fills before reading
+        if (ptr != 0 && live_size != 0) {
+            SrtNetRead(src, live_size);
+        }
         if (live_size != 0 && (ptr == 0 || !memory->TryReadBacking(src, dst, live_size))) {
             // Null T#s: the array binds null images, like the unflattened sharp did
             std::memset(dst, 0, live_size);

@@ -51,6 +51,9 @@ void MarkSrtCleanPages(u64 address, u32 size);
 /// Set or clear SRT page bits for [address, address + size) a word at a time, routing flagged loads through the clean-load callback; do
 /// nothing without a bitmap
 void SetSrtCleanPages(u64 address, u64 size, bool set);
+/// Register the page manager's callback for SRT reads outside walker code, and call it when any page in the range is flagged
+void SetSrtNetRead(void (*net_read)(u64 address, u64 size));
+void SrtNetRead(u64 address, u64 size);
 
 struct PersistentSrtInfo {
     // Special case when fetch shader uses step rates.

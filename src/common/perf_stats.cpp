@@ -178,6 +178,7 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::PipeLazyWaits, "pipe_lazy_waits", Unit::Count},
     {Id::PipeVerifyChecks, "pipe_verify_checks", Unit::Count},
     {Id::PipeVerifyMismatches, "pipe_verify_mismatches", Unit::Count},
+    {Id::PipeTasks, "pipe_tasks", Unit::Count},
 }};
 
 constexpr bool FieldsMatchIds() {

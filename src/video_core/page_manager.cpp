@@ -499,6 +499,7 @@ struct SignalImpl : public PageManager::Impl {
         rasterizer = rasterizer_;
         instance = this;
         Shader::SetSrtCleanLoad(&SrtWalkerCleanLoad);
+        Shader::SetSrtNetRead(&SrtNetRead);
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
@@ -604,9 +605,12 @@ struct SignalImpl : public PageManager::Impl {
         // The recording thread owns the caches while active; guest-thread readbacks go through the command processor, which may be waiting
         // for it
         const bool on_stage_b = Vulkan::DrawPipe::OnStageB();
-        const auto is_gpu_thread =
-            on_stage_b || std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         const bool is_write = Common::IsWriteError(context);
+        // CP writes such as compute-queue read pointers use the guest locked path while recording is pending, avoiding a drain on every
+        // write
+        const bool on_cp = std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+        const auto is_gpu_thread =
+            on_stage_b || (on_cp && !(is_write && rasterizer->DrawPipeBusy()));
         const bool perf = Common::PerfStats::Enabled();
         const auto start =
             perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -681,6 +685,13 @@ struct SignalImpl : public PageManager::Impl {
         *out = value;
         Common::PerfStats::Add(Common::PerfStats::Id::SrtCleanLoads);
         return true;
+    }
+
+    /// Wait for pending T# table writes before copying through the backing, just as walker loads do
+    static void SrtNetRead(u64 address, u64 size) {
+        if (Vulkan::DrawPipe::OnStageA()) {
+            rasterizer->PipeNetLoad(address, static_cast<u32>(size));
+        }
     }
 
     static void ReportCleanRead(VAddr addr) {

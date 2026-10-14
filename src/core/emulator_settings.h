@@ -618,6 +618,9 @@ struct GPUSettings {
     // Record draw and dispatch packets on shadPS4:DrawRec while the command processor keeps decoding; drain before other cache, runtime or
     // scheduler access; requires precise readbacks and recompiles shaders on first use for the SRT clean-page checks
     Setting<bool> draw_pipe{false};
+    // draw_pipe_steps moves extra work to the recording thread in order; bit 1 handles EOP, EOS and RELEASE_MEM fences using pending CP
+    // values; ignore other bits
+    Setting<u32> draw_pipe_steps{0};
     Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -719,6 +722,7 @@ struct GPUSettings {
             make_override<GPUSettings>("render_state_memo", &GPUSettings::render_state_memo),
             make_override<GPUSettings>("replicate_fill_hle", &GPUSettings::replicate_fill_hle),
             make_override<GPUSettings>("draw_pipe", &GPUSettings::draw_pipe),
+            make_override<GPUSettings>("draw_pipe_steps", &GPUSettings::draw_pipe_steps),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
@@ -743,8 +747,8 @@ struct GPUSettings {
         readback_hot_regions, depth_target_sampled_layout, gcn_unordered_dispatches,                \
         access_bitmap_tracking, page_spin_locks, range_fast_paths, unbounded_vsharp_cap_mb,         \
         texture_gc_full_scan, texture_gc_trigger_mb, image_pool_texture_max_kb,                     \
-        arena_evict_idle_s, render_state_memo, replicate_fill_hle, draw_pipe, dlss_nr_enabled,      \
-        dlss_nr_style, dlss_nr_intensity, dlss_nr_ui_correction))
+        arena_evict_idle_s, render_state_memo, replicate_fill_hle, draw_pipe, draw_pipe_steps,      \
+        dlss_nr_enabled, dlss_nr_style, dlss_nr_intensity, dlss_nr_ui_correction))
 template <typename BasicJsonType,
           nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
 void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
@@ -1100,6 +1104,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, RenderStateMemo, render_state_memo)
     SETTING_FORWARD_BOOL(m_gpu, ReplicateFillHle, replicate_fill_hle)
     SETTING_FORWARD_BOOL(m_gpu, DrawPipe, draw_pipe)
+    SETTING_FORWARD(m_gpu, DrawPipeSteps, draw_pipe_steps)
     // Keep srt_walker_clean_reads and readback_ahead disabled while draw_pipe runs without changing saved settings; clean reads interfere
     // with pending-write tracking, and readback_ahead caused flicker; the rasterizer logs this
     bool IsSrtWalkerCleanReadsOn() const {

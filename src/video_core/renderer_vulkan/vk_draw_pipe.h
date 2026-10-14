@@ -56,6 +56,12 @@ public:
     [[nodiscard]] bool ReachedPacket(u64 number) const noexcept {
         return consumed_packets.load(std::memory_order_acquire) >= number;
     }
+    /// Read the completed packet count from any thread; stage B's current packet is not yet included
+    [[nodiscard]] u64 ConsumedPackets() const noexcept {
+        return consumed_packets.load(std::memory_order_acquire);
+    }
+    /// Outside stage A, wait for the packets published when called; guest threads use this before freeing memory
+    void WaitPublished();
     /// Check on stage A whether all committed packets have run
     [[nodiscard]] bool Idle() const noexcept {
         return consumed.load(std::memory_order_acquire) == head;

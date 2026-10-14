@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <type_traits>
 #include <utility>
 
 namespace Common {
@@ -38,7 +39,11 @@ public:
 
     template <typename Functor>
     UniqueFunction(Functor&& functor)
-        : callable{std::make_unique<Callable<Functor>>(std::move(functor))} {}
+        : callable{std::make_unique<Callable<Functor>>(std::move(functor))} {
+        // Reject lvalues because Callable<F&> would retain a reference that can outlive its target
+        static_assert(!std::is_lvalue_reference_v<Functor>,
+                      "pass the callable as a temporary or std::move it");
+    }
 
     UniqueFunction& operator=(UniqueFunction&& rhs) noexcept = default;
     UniqueFunction(UniqueFunction&& rhs) noexcept = default;
