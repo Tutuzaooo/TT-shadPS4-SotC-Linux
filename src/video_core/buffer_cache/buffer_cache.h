@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -232,7 +233,7 @@ private:
 
     /// readback_hot_regions: records copies of the GPU-written bytes of the other
     /// recent readback windows into hot_buffer, before the readback drains the GPU
-    void RecordHotDownloads(VAddr skip_addr);
+    void RecordHotDownloads(VAddr skip_addr, bool hot_regions);
 
     /// readback_hot_regions: after the drain, writes the hot downloads to guest memory
     void ApplyHotDownloads(BpeHeapGuard* heap_guard);
@@ -394,6 +395,11 @@ private:
     u64 hot_total{};
     // Frente J probe: the readback being downloaded was asked for by a guest thread's fault
     bool guest_readback{};
+    /// Readback batching (PINK_RB_BATCH): addresses guest threads are waiting to have read
+    /// back. A readback that drains the GPU brings their windows along in the same drain, so
+    /// requests made at the same time cost one GPU wait instead of one each
+    std::mutex pending_rb_mutex;
+    boost::container::small_vector<VAddr, 16> pending_rb;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

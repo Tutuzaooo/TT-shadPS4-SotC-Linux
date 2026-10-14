@@ -15,6 +15,7 @@
 #include "common/guest_write_journal.h"
 #include "common/logging/events.h"
 #include "common/perf_stats.h"
+#include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -239,6 +240,31 @@ void Record(VAddr request, u64 run_bytes, u64 run_changed, bool hot) {
 }
 } // namespace ReadbackUse
 
+/// SHADPS4_PERF_STATS: where a guest readback's wait goes: queued behind other work of the
+/// command processor thread, or the readback itself; and how many other guest threads were
+/// waiting for a readback when it started
+namespace ReadbackLatency {
+std::atomic<u64> queue_ns{}, run_ns{}, count{}, pending_sum{}, batched{};
+std::chrono::steady_clock::time_point last_report{};
+void Report() {
+    const auto now = std::chrono::steady_clock::now();
+    if (last_report == std::chrono::steady_clock::time_point{}) {
+        last_report = now;
+        return;
+    }
+    if (now - last_report < std::chrono::seconds{10}) {
+        return;
+    }
+    last_report = now;
+    const u64 n = std::max<u64>(count.exchange(0), 1);
+    LOG_WARNING(Render,
+                "Readback latency: {} guest readbacks, queued {:.0f} ms, running {:.0f} ms, "
+                "{:.2f} other threads waiting on average, {} windows brought along for them",
+                n, queue_ns.exchange(0) / 1e6, run_ns.exchange(0) / 1e6,
+                static_cast<double>(pending_sum.exchange(0)) / n, batched.exchange(0));
+}
+} // namespace ReadbackLatency
+
 static void ReportHeapGuardHit(VAddr addr, u64 bytes) {
     // Only the GPU command processor thread downloads memory
     static u64 hits = 0;
@@ -334,9 +360,28 @@ void BufferCache::ReleaseCpuAuthoritativeRange(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    const auto flush_request = [this, device_addr, size, is_write, assume_locks] {
+    const auto enqueued = std::chrono::steady_clock::now();
+    const auto flush_request = [this, device_addr, size, is_write, assume_locks, enqueued] {
         const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Readbacks,
                                                         Common::PerfStats::Id::ReadbackNs};
+        const bool measure = !assume_locks && Common::PerfStats::Enabled();
+        const auto started = measure ? std::chrono::steady_clock::now() : enqueued;
+        if (measure) {
+            ReadbackLatency::queue_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             started - enqueued)
+                                             .count();
+            ++ReadbackLatency::count;
+            std::scoped_lock lk{pending_rb_mutex};
+            ReadbackLatency::pending_sum += pending_rb.empty() ? 0 : pending_rb.size() - 1;
+        }
+        SCOPE_EXIT {
+            if (measure) {
+                ReadbackLatency::run_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - started)
+                                               .count();
+                ReadbackLatency::Report();
+            }
+        };
         // J0 probe: requests from guest threads come through SendCommand, the command processor's own
         // faults run inline
         guest_readback = !assume_locks && Common::PerfStats::Enabled();
@@ -373,8 +418,27 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
     } else {
         const Common::PerfStats::ScopedNs wait_timer{Common::PerfStats::Id::GuestReadbackWaitNs};
+        {
+            std::scoped_lock lk{pending_rb_mutex};
+            pending_rb.push_back(device_addr);
+        }
         liverpool->SendCommand<true>(std::move(flush_request));
+        std::scoped_lock lk{pending_rb_mutex};
+        if (const auto it = std::ranges::find(pending_rb, device_addr); it != pending_rb.end()) {
+            pending_rb.erase(it);
+        }
     }
+}
+
+/// PINK_RB_BATCH=0 turns readback batching off (BufferCache::pending_rb)
+static bool RbBatchOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("PINK_RB_BATCH");
+        const bool enabled = !v || v[0] != '0';
+        LOG_WARNING(Render, "Readback batching: {}", enabled ? "on" : "off");
+        return enabled;
+    }();
+    return on;
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -463,8 +527,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             Common::PerfStats::Add(Common::PerfStats::Id::GuestReadbackFinish);
         }
         runtime.CopyBuffer(arena, download.buffer, copies);
-        if (hot_regions) {
-            RecordHotDownloads(device_addr);
+        if (hot_regions || RbBatchOn()) {
+            RecordHotDownloads(device_addr, hot_regions);
         }
         scheduler.FinishHostRead();
     }
@@ -540,7 +604,7 @@ bool BufferCache::TouchHotReadback(VAddr addr, u64 size) {
     return true;
 }
 
-void BufferCache::RecordHotDownloads(VAddr skip_addr) {
+void BufferCache::RecordHotDownloads(VAddr skip_addr, bool hot_regions) {
     // Download other recent GPU-written windows while this readback drains the GPU
     // Keep DownloadMemory rules for CPU-owned stacks, modified ranges and clean pages
     const Common::PerfStats::ScopedNs perf_timer{Common::PerfStats::Id::ReadbackHotNs};
@@ -563,60 +627,97 @@ void BufferCache::RecordHotDownloads(VAddr skip_addr) {
         const char* v = std::getenv("PINK_HOT_MAX_MB");
         return (v ? std::strtoull(v, nullptr, 10) : 4ull) << 20;
     }();
-    for (auto& hot : hot_readbacks) {
-        if (hot.addr == skip_addr || now - hot.last_request > HotReadbackLifetime ||
-            hot.hits < min_hits) {
-            continue;
-        }
-        if (max_bytes != 0 && total_size_bytes >= max_bytes) {
-            break;
-        }
+    // Records the copies of one window; false when nothing there is GPU-written
+    const auto add_window = [&](VAddr addr, u64 size) {
         // Bindings count as GPU-written before their command runs
         // Do not clear those pending writes in a grouped download
         // Read overlapping windows back separately
         if (std::ranges::any_of(open_writes, [&](const auto& write) {
-                return write.first < hot.addr + hot.size && hot.addr < write.first + write.second;
+                return write.first < addr + size && addr < write.first + write.second;
             })) {
-            continue;
+            return false;
+        }
+        if (std::ranges::any_of(hot_downloads,
+                                [&](const HotDownload& item) { return item.addr == addr; })) {
+            return false;
         }
         // Use the current arena because a migration leaves later resident
         // blocks out of the old one
-        const Buffer* arena = address_space[hot.addr >> ARENA_PAGE_BITS];
+        const Buffer* arena = address_space[addr >> ARENA_PAGE_BITS];
         if (!arena) {
-            continue;
+            return false;
         }
         const VAddr arena_base = arena->cpu_addr;
         const u32 first_copy = static_cast<u32>(hot_copies.size());
         bool gpu_modified = false;
-        memory_tracker->ForEachDownloadRange<false>(
-            hot.addr, hot.size, [&](u64 address, u64 range_size) {
-                gpu_modified = true;
-                gpu_modified_ranges.ForEachInRange(address, range_size, [&](VAddr start, VAddr end) {
-                    for (const auto& [lo, len] : memory->SubtractStackRanges(start, end - start)) {
-                        hot_copies.push_back(vk::BufferCopy{
-                            .srcOffset = lo - arena_base,
-                            .dstOffset = total_size_bytes,
-                            .size = len,
-                        });
-                        total_size_bytes += Common::AlignUp(len, 64ULL);
-                    }
-                });
-                SubtractGpuModified(address, range_size);
-                InvalidateCleanPages(address, range_size);
+        memory_tracker->ForEachDownloadRange<false>(addr, size, [&](u64 address, u64 range_size) {
+            gpu_modified = true;
+            gpu_modified_ranges.ForEachInRange(address, range_size, [&](VAddr start, VAddr end) {
+                for (const auto& [lo, len] : memory->SubtractStackRanges(start, end - start)) {
+                    hot_copies.push_back(vk::BufferCopy{
+                        .srcOffset = lo - arena_base,
+                        .dstOffset = total_size_bytes,
+                        .size = len,
+                    });
+                    total_size_bytes += Common::AlignUp(len, 64ULL);
+                }
             });
+            SubtractGpuModified(address, range_size);
+            InvalidateCleanPages(address, range_size);
+        });
         // Skip clean windows instead of unmarking their pages again
         // That repeated work caused stutters when moving around the map
         if (!gpu_modified) {
-            continue;
+            return false;
         }
-        // Brought back, the window's next read does not fault and so does not renew it: renew it
-        // here while the GPU keeps writing it, or it would drop out after the lifetime and need
-        // min_hits faulting reads again
-        hot.last_request = now;
         // Windows the tracker marks GPU-written without GPU-written
         // bytes left are only unmarked
         const u32 num_copies = static_cast<u32>(hot_copies.size()) - first_copy;
-        hot_downloads.push_back({arena, hot.addr, hot.size, first_copy, num_copies});
+        hot_downloads.push_back({arena, addr, size, first_copy, num_copies});
+        return true;
+    };
+    // Readback batching first: other guest threads wait for these right now. Each comes as the
+    // window ReadMemory would download for it
+    if (RbBatchOn()) {
+        boost::container::small_vector<VAddr, 16> pending;
+        {
+            std::scoped_lock lk{pending_rb_mutex};
+            pending = pending_rb;
+        }
+        for (const VAddr addr : pending) {
+            const Buffer* arena = address_space[addr >> ARENA_PAGE_BITS];
+            if (!arena) {
+                continue;
+            }
+            constexpr u64 WindowSize = 512_KB;
+            const VAddr start = std::max<VAddr>(Common::AlignDown(addr, WindowSize), arena->cpu_addr);
+            const VAddr end =
+                std::min<VAddr>(start + WindowSize, arena->cpu_addr + arena->size_bytes);
+            if (start == skip_addr || end <= start) {
+                continue;
+            }
+            if (add_window(start, end - start) && Common::PerfStats::Enabled()) {
+                ++ReadbackLatency::batched;
+            }
+        }
+    }
+    if (hot_regions) {
+        for (auto& hot : hot_readbacks) {
+            if (hot.addr == skip_addr || now - hot.last_request > HotReadbackLifetime ||
+                hot.hits < min_hits) {
+                continue;
+            }
+            if (max_bytes != 0 && total_size_bytes >= max_bytes) {
+                break;
+            }
+            if (!add_window(hot.addr, hot.size)) {
+                continue;
+            }
+            // Brought back, the window's next read does not fault and so does not renew it:
+            // renew it here while the GPU keeps writing it, or it would drop out after the
+            // lifetime and need min_hits faulting reads again
+            hot.last_request = now;
+        }
     }
     hot_total = total_size_bytes;
     if (total_size_bytes == 0) {
