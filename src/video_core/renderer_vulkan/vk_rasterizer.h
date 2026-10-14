@@ -309,7 +309,9 @@ private:
     };
     boost::container::static_vector<ImageDescriptorRef, MaxPipelineImageDescriptors>
         image_descriptor_refs;
-    boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+    // Each stage can bind NUM_BUFFERS entries; buffer_infos and bound_buffers need room for every stage, like the image lists
+    static constexpr u32 MaxPipelineBuffers = Shader::NUM_BUFFERS * Shader::MaxStageTypes;
+    boost::container::static_vector<vk::DescriptorBufferInfo, MaxPipelineBuffers> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, MaxPipelineImageDescriptors> bound_images;
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
@@ -317,7 +319,7 @@ private:
         u32 size;
         bool is_written;
     };
-    boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
+    boost::container::static_vector<BoundBuffer, MaxPipelineBuffers> bound_buffers;
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
