@@ -659,6 +659,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 }
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
+    // Hold the lock while walking because Picked shares flags with guest write faults' CpuDirty bit, and guest threads also change the page
+    // table
+    std::scoped_lock lock{mutex};
     ImageIds image_ids;
     ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
         if (image.info.guest_address != address) {
@@ -764,6 +767,8 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
+        // Hold the lock against guest registration, write faults and unmaps that change the page table, LRU and Picked flags
+        std::scoped_lock lock{mutex};
         ImageId stencil_id{};
         ForEachImageInRegion(
             desc.info.stencil_addr, desc.info.stencil_size, [&](ImageId image_id, Image& image) {
