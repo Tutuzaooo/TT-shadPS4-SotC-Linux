@@ -908,6 +908,10 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionCpuModified(addr, size);
 }
 
+bool BufferCache::IsRegionFullyGpuModifiedTracked(VAddr addr, u64 size) {
+    return memory_tracker->IsRegionFullyGpuModified(addr, size);
+}
+
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     if (memory_tracker->IsRegionGpuModified(addr, size)) {
         return true;

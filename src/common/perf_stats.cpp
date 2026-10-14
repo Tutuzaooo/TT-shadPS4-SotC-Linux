@@ -195,6 +195,9 @@ bool Enabled() {
 std::array<Detail::PaddedSlot, static_cast<size_t>(Id::Count)> Detail::slots{};
 thread_local bool Detail::cp_thread = false;
 std::array<std::atomic<u64>, static_cast<size_t>(Id::Count)> Detail::cp_slots{};
+std::array<std::atomic<u64>, static_cast<size_t>(Id::Count)> Detail::pipe_slots{};
+thread_local std::array<std::atomic<u64>, static_cast<size_t>(Id::Count)>* Detail::own_slots =
+    nullptr;
 
 // 100 ms at startup, only with SHADPS4_PERF_STATS
 u64 Detail::ns_per_tick =
@@ -258,6 +261,11 @@ void OnReportEmitted(double seconds_since_start) {
 
 void MarkGpuThread() {
     Detail::cp_thread = true;
+    Detail::own_slots = &Detail::cp_slots;
+}
+
+void MarkDrawRecordThread() {
+    Detail::own_slots = &Detail::pipe_slots;
 }
 
 bool IsGpuThread() {
@@ -325,7 +333,8 @@ std::string TakeReport() {
     std::string report;
     for (const auto& field : Fields) {
         const size_t index = static_cast<size_t>(field.id);
-        const u64 cp_total = Detail::cp_slots[index].load(std::memory_order_relaxed);
+        const u64 cp_total = Detail::cp_slots[index].load(std::memory_order_relaxed) +
+                             Detail::pipe_slots[index].load(std::memory_order_relaxed);
         const u64 value = Detail::Slot(field.id).exchange(0, std::memory_order_relaxed) +
                           cp_total - cp_reported[index];
         cp_reported[index] = cp_total;

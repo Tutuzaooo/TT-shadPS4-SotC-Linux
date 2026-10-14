@@ -243,10 +243,14 @@ extern thread_local bool cp_thread;
 /// Use ordinary adds for command processor counters because they have one writer
 /// Report the difference since the previous TakeReport
 extern std::array<std::atomic<u64>, static_cast<size_t>(Id::Count)> cp_slots;
+/// Counters for the draw recording thread; see MarkDrawRecordThread
+extern std::array<std::atomic<u64>, static_cast<size_t>(Id::Count)> pipe_slots;
+/// Select cp_slots, pipe_slots or null for the current thread
+extern thread_local std::array<std::atomic<u64>, static_cast<size_t>(Id::Count)>* own_slots;
 
 inline void AddTo(Id id, u64 value) {
-    if (cp_thread) {
-        auto& slot = cp_slots[static_cast<size_t>(id)];
+    if (own_slots) {
+        auto& slot = (*own_slots)[static_cast<size_t>(id)];
         slot.store(slot.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
     } else {
         Slot(id).fetch_add(value, std::memory_order_relaxed);
@@ -367,6 +371,8 @@ private:
 
 /// Marks the calling thread as the GPU command processor thread
 void MarkGpuThread();
+/// Give this draw recording thread its own counters; IsGpuThread remains false
+void MarkDrawRecordThread();
 bool IsGpuThread();
 
 /// Formats the counters accumulated since the previous call and resets them

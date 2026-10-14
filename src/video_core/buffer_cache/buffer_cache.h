@@ -124,6 +124,9 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// Check without locking whether all pages are GPU-modified; safe for the command processor while the recording thread runs
+    [[nodiscard]] bool IsRegionFullyGpuModifiedTracked(VAddr addr, u64 size);
+
     /// Byte-precise: true when a written binding covered any byte of the range since its last readback.
     /// Readbacks copy only these bytes, so the backing already holds the value of every other byte.
     /// Command processor thread only

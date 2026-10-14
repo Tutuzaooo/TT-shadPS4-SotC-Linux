@@ -131,6 +131,27 @@ void MarkSrtCleanPages(u64 address, u32 size) {
     }
 }
 
+void SetSrtCleanPages(u64 address, u64 size, bool set) {
+    auto* const bits = WalkerContext().clean_pages;
+    if (!bits || size == 0 || address >= SrtCleanPageLimit) {
+        return;
+    }
+    const u64 first = address >> 12;
+    const u64 last = (std::min(address + size, SrtCleanPageLimit) - 1) >> 12;
+    for (u64 page = first; page <= last;) {
+        const u64 word = page >> 6;
+        const u64 lo = page & 63;
+        const u64 hi = std::min<u64>(63, lo + (last - page));
+        const u64 mask = (hi - lo == 63 ? ~u64{0} : ((u64{1} << (hi - lo + 1)) - 1)) << lo;
+        if (set) {
+            bits[word] |= mask;
+        } else {
+            bits[word] &= ~mask;
+        }
+        page += hi - lo + 1;
+    }
+}
+
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     EnsureSrtSignalHandler();
     std::scoped_lock lk{g_srt_code_mutex};
@@ -1200,6 +1221,8 @@ const SrtWalkerContext* GetSrtWalkerContext() {
 void SetSrtCleanLoad(bool PS4_SYSV_ABI (*clean_load)(u64, u32, u64*)) {}
 
 void MarkSrtCleanPages(u64 address, u32 size) {}
+
+void SetSrtCleanPages(u64 address, u64 size, bool set) {}
 
 void CompleteSrtLoad(void* context, const SrtLoad& load, u64 value) {}
 

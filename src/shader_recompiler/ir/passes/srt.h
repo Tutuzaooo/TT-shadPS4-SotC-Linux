@@ -48,6 +48,9 @@ const SrtWalkerContext* GetSrtWalkerContext();
 void SetSrtCleanLoad(bool PS4_SYSV_ABI (*clean_load)(u64, u32, u64*));
 /// Marks pages that can try the clean-load fast path
 void MarkSrtCleanPages(u64 address, u32 size);
+/// Set or clear SRT page bits for [address, address + size) a word at a time, routing flagged loads through the clean-load callback; do
+/// nothing without a bitmap
+void SetSrtCleanPages(u64 address, u64 size, bool set);
 
 struct PersistentSrtInfo {
     // Special case when fetch shader uses step rates.
