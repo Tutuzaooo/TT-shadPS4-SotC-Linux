@@ -137,10 +137,10 @@ ReplicateFillPlan PlanReplicateFill(const Shader::Info& info,
     const auto ctl = buffers[0]->GetSharp(ud);
     const auto src = buffers[1]->GetSharp(ud);
     const auto out = buffers[2]->GetSharp(ud);
-    const u32 src_stride = src.GetStride() ? src.GetStride() : 4;
-    const u32 dst_stride = out.GetStride() ? out.GetStride() : 4;
-    if (src_stride != 4 || dst_stride != 4 || ctl.GetSize() < 8 || ctl.base_address <= 1 ||
-        src.base_address <= 1 || out.base_address <= 1) {
+    // Match idxen addressing: stride 0 makes all threads use element 0, and swizzled V#s reorder elements
+    if (src.GetStride() != 4 || out.GetStride() != 4 || src.swizzle_enable || out.swizzle_enable ||
+        ctl.GetSize() < 8 || ctl.base_address <= 1 || src.base_address <= 1 ||
+        out.base_address <= 1) {
         return Refused;
     }
     dst = out.base_address;
