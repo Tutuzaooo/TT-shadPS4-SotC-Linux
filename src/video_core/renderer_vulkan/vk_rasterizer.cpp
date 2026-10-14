@@ -920,14 +920,13 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     MakeTargetsKey(pipeline, key);
     const bool hit = rs_targets.valid && key == rs_targets.key && TargetsUnchanged(rs_targets);
     if (hit) {
-        const size_t first_bound = bound_images.size();
-        ReuseTargets(rs_targets);
         if (!rs_memo_verify) {
+            ReuseTargets(rs_targets);
             return;
         }
-        // Verification repeats the lookups and uses their result for this draw
+        // Compare the memo without changing image flags; setting is_target here could leave it set on an image the full lookups no longer
+        // return; draw with the full lookup result
         ++rs_verify_targets;
-        bound_images.resize(first_bound);
     }
 
     const u64 image_sets = texture_cache.ImageSetGeneration();
