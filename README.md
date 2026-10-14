@@ -96,6 +96,30 @@ These defaults are from the emulator; per-game presets may override them.
 | `lds_barriers_large_groups` | `true` | Adds shared-memory barriers to compute workgroups larger than 64 threads to fix the blown-out sun on NVIDIA. |
 | `eop_label_delay_us` | `0` | Temporary workaround for SotC's flickering rocks: delays graphics EOP labels by a fixed number of microseconds (`2000` was used in testing); `0` disables it. This does not guarantee GPU completion, and enabling `readback_ahead` can bring the flicker back. |
 
+#### GPU keys added in 0.4.0
+
+These defaults are from the emulator; per-game presets may override them.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `relative_instance_id` | `false` | Starts shader instance IDs at zero for each draw. May fix misplaced geometry and effects. |
+| `gcn_nan_semantics` | `false` | Matches console handling of invalid floating-point values. May fix fog and lighting artifacts. |
+| `legacy_mad_semantics` | `false` | Matches console behavior for legacy multiply-add calculations. Use with `gcn_nan_semantics`. |
+| `force_anisotropy` | `0` | Raises anisotropic filtering for eligible textures to improve clarity at an angle, with more GPU work. Accepts `2`, `4`, `8` or `16`; `0` keeps the game's filtering. |
+| `readback_hot_regions` | `false` | Downloads recently requested GPU memory regions together. May reduce repeated waits, but can transfer more data. |
+| `depth_target_sampled_layout` | `false` | Reuses the same image layout when sampling a read-only depth target. May reduce synchronization overhead, but can cause occasional visual glitches. |
+| `gcn_unordered_dispatches` | `false` | Lets compute tasks overlap when the game does not request synchronization. May improve GPU performance, but can cause occasional visual glitches. |
+| `access_bitmap_tracking` | `false` | Uses compact maps to track buffer access. May reduce CPU work while preserving synchronization. |
+| `page_spin_locks` | `false` | Uses lightweight locks for GPU memory tracking. May reduce CPU overhead; applies when the game starts. |
+| `range_fast_paths` | `false` | Skips redundant buffer tracking and synchronization checks. May reduce CPU work. |
+| `unbounded_vsharp_cap_mb` | `0` | Limits VRAM allocated to read-only buffers with no declared size. May reduce VRAM use, but can cause unstable geometry or missing objects; `0` disables it. |
+| `texture_gc_full_scan` | `false` | Improves cleanup of unused textures. May reduce VRAM use, but textures must be reloaded if needed again. |
+| `texture_gc_trigger_mb` | `0` | Sets the VRAM usage threshold in MB for cleaning up unused textures. Lower values increase texture reloads; `0` selects the threshold automatically. |
+| `image_pool_texture_max_kb` | `0` | Allocates textures above this size in KB separately from the image pool. May reduce retained VRAM, but can cause loading stutter. Requires `image_memory_pool`; `0` disables it. |
+| `arena_evict_idle_s` | `0` | Releases unused buffer memory after this many seconds, preserving GPU-written data. May reduce VRAM use, but reloading can cause stutter or visual issues; `0` disables it. |
+
+Changing `relative_instance_id`, `gcn_nan_semantics` or `legacy_mad_semantics` recompiles shaders and may cause temporary stuttering.
+
 ### Other settings used by the SotC presets
 
 These are regular emulator settings stored alongside the workarounds in the shipped presets.
@@ -108,6 +132,33 @@ These are regular emulator settings stored alongside the workarounds in the ship
 | `readbacks_mode` | Selects the GPU readback accuracy mode; the SotC preset uses precise mode (`2`). |
 | `pipeline_cache_enabled` | Reuses cached Vulkan pipelines to reduce shader compilation stutter. |
 | `windows_guest_red_zone_protection_mode` | Selects the Windows guest red-zone protection strategy. |
+
+### PS4 Pro rendering added in 0.4.0
+
+Available in the game's **General > PS4 Pro** settings in the launcher.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `sotc_pro_4k` | `false` | Enables higher-resolution PS4 Pro rendering in SotC. Requires `neo_mode` and automatically increases game memory. Improves image detail, but uses more GPU and memory and may worsen flickering. |
+
+### DLSS Neural Rendering added in 0.4.0
+
+Requires Windows, an NVIDIA RTX GPU and `nvngx_dlssnr.dll` next to `shadps4.exe`. These GPU settings are not exposed in the launcher; press **F1** to toggle the effect in game. HDR is not supported.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `dlss_nr_enabled` | `false` | Applies Neural Rendering to the final frame. May improve image detail, but adds GPU work. |
+| `dlss_nr_style` | `0` | Selects the image style: `0` Default, `1` Natural or `2` Cinematic. |
+| `dlss_nr_intensity` | `1.0` | Sets the detail strength from `0` to `2`. Higher values apply a stronger effect. |
+| `dlss_nr_ui_correction` | `true` | Enables HUD correction to help preserve the game's interface. |
+
+The input key `hotkey_toggle_dlss_nr` selects the toggle shortcut; its default is `f1`.
+
+### Console logging added in 0.4.0
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `console_mode` (Log) | `events` | Shows crash, shader and rendering problems in the console. Use `all` to mirror the full log; the log file keeps all recorded messages in either mode. |
 
 ### Shader cache
 
