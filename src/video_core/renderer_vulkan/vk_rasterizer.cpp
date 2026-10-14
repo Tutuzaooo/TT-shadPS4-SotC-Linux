@@ -1715,9 +1715,9 @@ bool Rasterizer::RunReplicateFill(const Shader::Info& cs, const AmdGpu::ComputeP
         verify_dst = dst;
         return false;
     }
-    // Upload the old bytes before changing a range used by bindings since the last flush
-    if (buffer_cache.IsRegionInSyncBatch(dst, bytes)) {
-        buffer_cache.FlushSyncBatch();
+    // Preserve old bytes for existing bindings and upload new bytes in a later session, since uploads run before every command in their
+    // session
+    if (buffer_cache.FlushForStreamWrite(dst, bytes)) {
         Common::PerfStats::Add(Id::FillHleFlushes);
     }
     // Handle this like a write fault: read back GPU data and mark the pages CPU-modified
@@ -3457,10 +3457,8 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         // The journal copies up to 16 bytes of data
         const u32 pattern[4] = {value, value, value, value};
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
-            // Upload old bytes before overwriting a range used since the last flush, as WRITE_DATA and DUMP_CONST_RAM do
-            if (buffer_cache.IsRegionInSyncBatch(address, num_bytes)) {
-                buffer_cache.FlushSyncBatch();
-            }
+            // Upload old bytes before an overlapping CPU write, checking the whole session as WRITE_DATA and DUMP_CONST_RAM do
+            buffer_cache.FlushForStreamWrite(address, num_bytes);
             Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::FillCpu, address,
                                               num_bytes, pattern, value);
             u32* buffer = std::bit_cast<u32*>(address);
@@ -3487,7 +3485,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         !buffer_cache.IsRegionInSyncBatch(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
-            // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
+            // Both buffers are still CPU-side, so copy in host memory; earlier bindings may read dst from the arena, so put new bytes in a
+            // later session
+            buffer_cache.FlushForStreamWrite(dst, num_bytes);
             Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::CopyCpu, dst,
                                               num_bytes, std::bit_cast<const void*>(src), src);
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);

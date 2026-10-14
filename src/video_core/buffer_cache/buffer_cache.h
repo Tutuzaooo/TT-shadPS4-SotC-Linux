@@ -85,6 +85,16 @@ public:
         return sync_batch.Overlaps(addr, addr + size);
     }
 
+    /// Check whether a binding in this session covers [addr, addr + size); later uploads in the same session would reach that command
+    /// before it runs
+    [[nodiscard]] bool IsRegionInSession(VAddr addr, size_t size) const noexcept {
+        return sync_batch.Overlaps(addr, addr + size) || session_batch.Overlaps(addr, addr + size);
+    }
+
+    /// Before an ordered CPU write, flush old bytes for overlapping bindings and start a new session even if no upload is needed; session
+    /// uploads run before all commands; return whether a new session was started
+    bool FlushForStreamWrite(VAddr addr, u64 size);
+
     /// Returns minimum granularity of a sparse memory bind.
     u32 GetSparsePageShift() const noexcept {
         return block_shift;
@@ -196,8 +206,8 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
-    /// Flushes pending synchronization requests
-    void FlushSyncBatch(bool from_scheduler = false);
+    /// Flush pending sync requests; from_scheduler ends the session, while new_session starts one even without uploads
+    void FlushSyncBatch(bool from_scheduler = false, bool new_session = false);
 
 private:
     struct ArenaBinds {
@@ -452,6 +462,8 @@ private:
         }
     };
     DomIntervalList<SyncRange> sync_batch{};
+    /// Keep ranges from batches flushed without uploads in this session; its commands still read them from the arena; owned like sync_batch
+    DomIntervalList<SyncRange> session_batch{};
     std::atomic<u64> sync_batch_generation{};
     std::atomic<u64> arena_generation{};
     /// Whether the current sync batch already covers every resident range

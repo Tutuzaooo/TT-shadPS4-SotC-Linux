@@ -78,6 +78,7 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::PipelineBindsSkipped, "pipeline_binds_skipped", Unit::Count},
     {Id::BufferUploadBytes, "buf_upload_kb", Unit::Kb},
     {Id::SyncFlushes, "sync_flushes", Unit::Count},
+    {Id::StreamWriteSessions, "stream_write_sessions", Unit::Count},
     {Id::Protects, "protects", Unit::Count},
     {Id::Splits, "splits", Unit::Count},
     {Id::ProtectNs, "protect_ms", Unit::Ms},

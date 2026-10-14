@@ -1522,7 +1522,15 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     pending_binds.clear();
 }
 
-void BufferCache::FlushSyncBatch(bool from_scheduler) {
+bool BufferCache::FlushForStreamWrite(VAddr addr, u64 size) {
+    if (!IsRegionInSession(addr, size)) {
+        return false;
+    }
+    FlushSyncBatch(false, true);
+    return true;
+}
+
+void BufferCache::FlushSyncBatch(bool from_scheduler, bool new_session) {
     if (range_fast && Common::PerfStats::Enabled()) {
         using Common::PerfStats::Id;
         Common::PerfStats::Add(Id::RangeFastWrittenHits, std::exchange(range_fast_written_hits, 0));
@@ -1549,10 +1557,20 @@ void BufferCache::FlushSyncBatch(bool from_scheduler) {
                 }
             });
     }
+    if (from_scheduler || new_session || !copies.empty()) {
+        // End this session, or start the next one below
+        session_batch.Clear();
+    } else if (!sync_batch.Empty()) {
+        session_batch.AddSorted(std::span<const SyncRange>{sync_batch.begin(), sync_batch.end()});
+    }
     sync_batch.Clear();
     sync_batch_generation.fetch_add(1, std::memory_order_release);
     dma_sync_covered = false;
     if (copies.empty()) {
+        if (new_session && !from_scheduler) {
+            Common::PerfStats::Add(Common::PerfStats::Id::StreamWriteSessions);
+            scheduler.BeginSession();
+        }
         return;
     }
     Common::PerfStats::Add(Common::PerfStats::Id::SyncFlushes);

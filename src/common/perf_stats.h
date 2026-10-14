@@ -87,6 +87,8 @@ enum class Id : u32 {
     BufferUploadBytes,
     // Buffer cache sync batch flushes (uploads of CPU-modified ranges before GPU use)
     SyncFlushes,
+    // Count sessions started without uploads before an ordered CPU write because an earlier binding overlaps the write
+    StreamWriteSessions,
     // Address-space churn: tracker protection calls and Windows view splits
     Protects,
     Splits,
@@ -213,8 +215,8 @@ enum class Id : u32 {
     // cap, and the bytes cut off
     UnboundedClamps,
     UnboundedClampBytes,
-    // Count CPU fills and bytes, GPU fallbacks, flushes for overlapping bindings and readbacks before CPU writes; SHADPS4_FILL_HLE_VERIFY
-    // also counts output comparisons and mismatches
+    // Count CPU fills and bytes, GPU fallbacks, flushes for bindings in the current session, and readbacks before CPU writes; verification
+    // also counts comparisons and mismatches
     FillHleRuns,
     FillHleBytes,
     FillHleRefused,

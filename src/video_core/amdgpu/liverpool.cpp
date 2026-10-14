@@ -553,10 +553,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             if (rasterizer) {
                 // Drain before copying to guest memory below
                 rasterizer->DrainDrawPipe();
-                auto& buffer_cache = rasterizer->GetBufferCache();
-                if (buffer_cache.IsRegionInSyncBatch(dump_const->Address<VAddr>(), size)) {
-                    buffer_cache.FlushSyncBatch();
-                }
+                // Check bindings from the whole current session for overlap
+                rasterizer->GetBufferCache().FlushForStreamWrite(dump_const->Address<VAddr>(),
+                                                                 size);
             }
             Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::DumpConstRam,
                                               dump_const->Address<VAddr>(), size,
@@ -1256,6 +1255,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!write_data->wr_one_addr.Value()) {
                     if (rasterizer) {
                         rasterizer->OnFence();
+                        // Check bindings from the whole current session for overlap
+                        rasterizer->GetBufferCache().FlushForStreamWrite(
+                            reinterpret_cast<VAddr>(address), data_size);
                     }
                     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::WriteData,
                                                       reinterpret_cast<u64>(address), data_size,
@@ -1682,6 +1684,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!write_data->wr_one_addr.Value()) {
                 if (rasterizer) {
                     rasterizer->OnFence();
+                    // Check bindings from the whole current session for overlap
+                    rasterizer->GetBufferCache().FlushForStreamWrite(write_data->Address<VAddr>(),
+                                                                     data_size);
                 }
                 Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::WriteData,
                                                   write_data->Address<VAddr>(), data_size,
