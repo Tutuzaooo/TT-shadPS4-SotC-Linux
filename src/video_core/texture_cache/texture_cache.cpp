@@ -1269,8 +1269,6 @@ void TextureCache::UpdateTarget(ImageId image_id) {
         }
     }
     std::scoped_lock lk{mutex};
-    // Fetch the image again under the lock
-    // Guest video buffer registration can grow slot_images while this thread waits
     Image& locked = slot_images[image_id];
     TrackImage(image_id);
     TouchImage(locked);
@@ -1302,7 +1300,6 @@ void TextureCache::TouchReusedTarget(ImageId image_id, const ImageDesc& desc) {
         }
         image.usage.render_target = 1u;
     }
-    // UpdateTarget goes last because slot_images may grow while it waits for the lock
     UpdateTarget(image_id);
 }
 
