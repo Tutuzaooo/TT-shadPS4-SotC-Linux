@@ -217,20 +217,25 @@ private:
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
-    // Room for dynamic_tsharp_array_size descriptor arrays (array_size + 1 bindings each; the recompiler
-    // keeps a shader's arrays within NUM_IMAGE_ARRAY_DESCRIPTORS)
+    // Allow descriptor arrays in every stage, with array_size + 1 bindings per array and NUM_IMAGE_ARRAY_DESCRIPTORS limiting each shader;
+    // image_infos also holds samplers, and bound_images also holds targets, including rebound targets
     static constexpr u32 MaxImageDescriptors =
         Shader::NUM_IMAGES + Shader::NUM_IMAGE_ARRAY_DESCRIPTORS;
-    boost::container::static_vector<vk::DescriptorImageInfo, MaxImageDescriptors> image_infos;
+    static constexpr u32 MaxPipelineImageDescriptors =
+        (MaxImageDescriptors + Shader::NUM_SAMPLERS) * Shader::MaxStageTypes +
+        2 * AmdGpu::NUM_COLOR_BUFFERS + 1;
+    boost::container::static_vector<vk::DescriptorImageInfo, MaxPipelineImageDescriptors>
+        image_infos;
     // Sampled descriptors that need a final layout refresh
     struct ImageDescriptorRef {
         u32 info_index;
         const VideoCore::Image::BackingImage* backing;
         u32 subres_idx;
     };
-    boost::container::static_vector<ImageDescriptorRef, MaxImageDescriptors> image_descriptor_refs;
+    boost::container::static_vector<ImageDescriptorRef, MaxPipelineImageDescriptors>
+        image_descriptor_refs;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
-    boost::container::static_vector<VideoCore::ImageId, MaxImageDescriptors> bound_images;
+    boost::container::static_vector<VideoCore::ImageId, MaxPipelineImageDescriptors> bound_images;
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
         u64 offset;
