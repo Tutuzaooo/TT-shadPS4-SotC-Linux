@@ -421,7 +421,7 @@ bool Instance::CreateDevice() {
     // aside) is the copy engine, which runs beside the graphics queue instead of timeslicing with it. Video
     // and optical-flow families may also expose transfer, on a slower engine
     std::optional<u32> transfer_family;
-    if (EmulatorSettings.IsReadbackAhead() && EmulatorSettings.IsReadbackAheadTransferQueue()) {
+    if (EmulatorSettings.IsReadbackAheadOn() && EmulatorSettings.IsReadbackAheadTransferQueue()) {
         constexpr vk::QueueFlags allowed = vk::QueueFlagBits::eTransfer |
                                            vk::QueueFlagBits::eSparseBinding |
                                            vk::QueueFlagBits::eProtected;

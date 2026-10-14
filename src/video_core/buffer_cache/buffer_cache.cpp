@@ -64,7 +64,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       loop_cap_buffer{instance, 0, 256, MemoryType::HostCached, "Loop Cap Buffer"},
-      readback_ahead{EmulatorSettings.IsReadbackAhead()},
+      readback_ahead{EmulatorSettings.IsReadbackAheadOn()},
       track_writers{readback_ahead || Common::PerfStats::Enabled()},
       arena_evict_idle_s{EmulatorSettings.GetArenaEvictIdleS()}, memory_semaphore{instance},
       dma_sync_once{EmulatorSettings.IsDmaSyncOncePerBatch()},

@@ -17,9 +17,9 @@ namespace Vulkan {
 
 class Pipeline;
 
-/// Transfer stage A's draw or dispatch state to stage B for binding and recording; stage B reads registers, extents and user data from this
-/// packet; 8-byte aligned sections contain Header, u16 block indices, register words, each Stage with its user data and flat data, then a
-/// dispatch's ComputeProgram
+/// Transfer stage A's draw or dispatch state to stage B for binding and recording; use 8-byte aligned sections for Header, block indices,
+/// register words, each Stage with its user data and flat data, a dispatch's ComputeProgram, and the full register file when verify is
+/// enabled
 namespace DrawPacket {
 
 enum class Kind : u8 {
@@ -55,6 +55,9 @@ struct Header {
     u8 depth_copy;             ///< DepthStencilCopy filter result
     u8 stencil_copy;
     u8 fill_hle; ///< Stage A selected this dispatch as a CPU fill candidate
+    u8 verify;   ///< SHADPS4_PIPE_VERIFY includes the full register file for stage B checks
+    /// Carry synchronized rings from gcn_unordered_dispatches while the recording thread had pending packets
+    u16 game_sync_rings;
     u32 index_offset;
     const Pipeline* pipeline;
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent;

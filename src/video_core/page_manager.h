@@ -49,6 +49,10 @@ public:
     /// Diagnostic: (read watchers, write watchers) of the page holding addr
     std::pair<u32, u32> GetWatchers(VAddr addr) const;
 
+    /// Treat recording-thread faults as cache-owner faults; userfaultfd cannot identify that owner and could send a readback to a command
+    /// processor already waiting for it
+    bool HandlesDrawRecordThread() const;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

@@ -1142,6 +1142,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
                src/video_core/renderer_vulkan/vk_draw_packet.h
+               src/video_core/renderer_vulkan/vk_draw_pipe.cpp
+               src/video_core/renderer_vulkan/vk_draw_pipe.h
                src/video_core/renderer_vulkan/vk_draw_trace.h
                src/video_core/renderer_vulkan/vk_gpu_checkpoints.h
                src/video_core/renderer_vulkan/vk_instance.cpp

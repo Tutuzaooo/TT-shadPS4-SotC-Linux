@@ -5,6 +5,7 @@
 
 #include <array>
 #include <chrono>
+#include <deque>
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -13,6 +14,7 @@
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bind_cache.h"
 #include "video_core/renderer_vulkan/vk_draw_packet.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -38,21 +40,45 @@ public:
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
 
+    // Drain on the command processor before accessing state owned by the recording thread
     [[nodiscard]] Scheduler& GetScheduler() noexcept {
+        DrainDrawPipe();
         return scheduler;
     }
 
     [[nodiscard]] Runtime& GetRuntime() noexcept {
+        DrainDrawPipe();
         return runtime;
     }
 
     [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
+        DrainDrawPipe();
         return buffer_cache;
     }
 
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
+        DrainDrawPipe();
         return texture_cache;
     }
+
+    /// Drain all published packets on the command processor and apply queued guest syncs before accessing caches, runtime or scheduler; do
+    /// nothing on other threads or without draw_pipe
+    void DrainDrawPipe() {
+        if (draw_pipe && DrawPipe::OnStageA()) {
+            draw_pipe->Drain();
+            if (pending_game_sync != 0) {
+                ApplyPendingGameSync();
+            }
+        }
+    }
+    /// Check on the command processor whether recording packets are still pending
+    [[nodiscard]] bool DrawPipeBusy() const noexcept {
+        return draw_pipe && !draw_pipe->Idle();
+    }
+    /// Handle an unmet CP memory wait using cp_progress; yield without draining while other queues keep decoding packets
+    void DrainForCpWait(u64 cp_progress);
+    /// Before an SRT load from a flagged page, wait for any pending writer of those bytes; the load can then fault and read back GPU data
+    void PipeNetLoad(VAddr addr, u32 size);
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
@@ -169,18 +195,34 @@ private:
     DrawPacket::Filter FilterDraw(u8& depth_copy, u8& stencil_copy) const;
     void RunFilter(const DrawPacket::Header& packet);
 
-    // Stage A filters the draw, selects its pipeline and builds a packet; stage B records it immediately afterward on the command processor
-    // thread, using Regs(), extent accessors and Shader::Info accessors to read the packet's state
+    // Stage A filters draws, selects pipelines and builds packets; stage B records inline or on the recording thread, reading packet state
+    // through register, extent and Shader::Info accessors
     void DrawPrepare(bool is_indexed, u32 index_offset);
     void DrawIndirectPrepare(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                              u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                              u16 instance_sgpr_offset);
     void DispatchPrepare(bool indirect, VAddr address, u32 size, s8 ring);
-    /// Write the packet header, changed register blocks, target extents and each pipeline stage's user data
+    /// Write changed registers, target extents and stage user data into the ring or inline packet_buffer; SubmitPacket publishes the result
     DrawPacket::Header& BuildPacket(DrawPacket::Kind kind, const Pipeline* pipeline, bool compute);
-    void RunPacket();
-    /// SHADPS4_PIPE_VERIFY=N compares stage B's captured state with live state every N packets
-    void VerifyPacket(const DrawPacket::Header& packet);
+    void SubmitPacket();
+    void RunPacket(const u8* data);
+    static void RunPipePacket(void* context, const u8* data, u32 size);
+    /// Decide whether this packet uses the recording thread from draw_pipe and SHADPS4_AB_TOGGLE
+    [[nodiscard]] bool UsePipe() const noexcept {
+        return draw_pipe && Common::PerfStats::AbToggleOn(draw_pipe_toggle);
+    }
+    /// Flag pending output ranges whose pages are not yet GPU-modified for the SRT clean-load check; keep them flagged until stage B runs
+    /// the packet
+    void CollectNetRanges(const Pipeline* pipeline);
+    /// Remove completed ranges and clear page bits once no pending range remains
+    void PruneNet();
+    /// Guest syncs queued while the recording thread had pending packets
+    void ApplyPendingGameSync();
+    /// SHADPS4_PIPE_VERIFY=N checks captured registers every N packets; inline checks also compare extents, compute state and user data
+    /// with live values; recording-thread checks rerun SRT walks after earlier packets finish
+    void VerifyPacket(const DrawPacket::Header& packet, const AmdGpu::Regs& packed);
+    /// Read shader code from the backing without using stage B's clean-page cache; return false for addresses without backing
+    bool ReadCodeMemory(VAddr addr, void* out, u64 size);
     void DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
     void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed, VAddr arg_address,
                             u32 stride, u32 max_count, VAddr count_address);
@@ -436,19 +478,24 @@ private:
     u64 tsharp_array_binds_minute{};
     u64 tsharp_array_null_minute{};
     std::chrono::steady_clock::time_point tsharp_array_last_report{};
-    // Store the growing, 8-byte aligned packet buffer, stage B's registers and extents, and the active packet view; outside recording,
-    // accessors use live state
+    // Keep the aligned inline buffer, packet destination, thread choice, stage B's register copy and active packet view; accessors fall
+    // back to live state outside recording
     std::unique_ptr<u64[]> packet_buffer;
     u32 packet_capacity{};
+    u8* packet_data{};
+    bool packet_in_pipe{};
     std::unique_ptr<AmdGpu::Regs> pipe_regs;
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> pipe_cb_extent{};
     AmdGpu::CbDbExtent pipe_db_extent{};
     static inline thread_local const AmdGpu::Regs* stage_regs = nullptr;
     static inline thread_local const AmdGpu::ComputeProgram* stage_cs = nullptr;
     const u32 pipe_verify_interval; ///< SHADPS4_PIPE_VERIFY interval; 0 disables checks
-    u64 pipe_verify_packets{};
-    u64 pipe_verify_checks{};
+    u64 pipe_verify_packets{};      ///< Used by stage A
+    u64 pipe_verify_checks{};       ///< Stage B state begins here
     u64 pipe_verify_mismatches{};
+    u64 pipe_verify_walks{};
+    u64 pipe_verify_walk_mismatches{};
+    std::vector<u32> pipe_verify_flat;
     std::chrono::steady_clock::time_point pipe_verify_last_report{};
     // Store the replicate_fill_hle setting, A/B participation and verification mode; stage A selects candidates and stage B plans and runs
     // them; GPU fallbacks flush immediately so later walks see their write marks
@@ -462,6 +509,26 @@ private:
     u64 fill_verify_checks{};
     u64 fill_verify_mismatches{};
     std::chrono::steady_clock::time_point fill_verify_last_report{};
+    // Track pending output ranges in packet order, replacing repeated addresses with the newest packet number; clear completed ranges' page
+    // bits once no pending range remains; requires precise readbacks and a clean-page bitmap
+    struct NetRange {
+        VAddr addr;
+        u64 size;
+        u64 packet;
+    };
+    std::deque<NetRange> net_pending;
+    std::vector<std::pair<VAddr, u64>> net_to_clear;
+    const bool net_enabled;
+    u64 cp_wait_progress{~u64{0}}; ///< CP progress recorded at the last unmet wait
+    // Last backing page cached by ReadCodeMemory on stage A
+    VAddr code_page_addr{~VAddr{0}};
+    const u8* code_page_backing{};
+    u64 code_page_generation{};
+    /// Queue synchronized rings for stage A's next packet or drain
+    u16 pending_game_sync{};
+    const bool draw_pipe_toggle; ///< Follow SHADPS4_AB_TOGGLE for draw_pipe
+    // Declare the ring and recording thread last so the thread stops before its dependencies are destroyed
+    std::unique_ptr<DrawPipe> draw_pipe;
 };
 
 } // namespace Vulkan

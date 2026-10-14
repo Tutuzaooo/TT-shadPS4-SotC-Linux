@@ -135,7 +135,7 @@ public:
     }
 
     /// Check for GPU-written bytes elsewhere on the pages of [addr, addr + size); page tracking would force a readback before a CPU write;
-    /// command processor thread only
+    /// call on the active recording thread
     [[nodiscard]] bool HasGpuWritesAround(VAddr addr, u64 size) const;
 
     enum class CleanRead { Served, GpuWritten, Miss };

@@ -10,19 +10,19 @@
 
 namespace Shader {
 
-void Info::RefreshSharpTables() {
+void Info::FillSharpTables(u32* flat, bool* count_logged) const {
     constexpr VAddr AddressMask = 0xFFFFFFFFFFFFULL;
     auto* memory = Core::Memory::Instance();
     for (const SharpTable& table : sharp_tables) {
-        u32* dst = flattened_ud_buf.data() + table.flatbuf_off;
+        u32* dst = flat + table.flatbuf_off;
         const u64 size = u64{table.NumDwords()} * sizeof(u32);
         u32 live = table.num_elements;
         if (table.count_loc != UNKNOWN_LOCATION) {
             // Entries past n are not T#s; in SotC's vs 0x9d6f9bf4 they look like a T# over the constant ring and caused a GPU hang
-            const s32 count = static_cast<s32>(flattened_ud_buf[table.count_loc]);
+            const s32 count = static_cast<s32>(flat[table.count_loc]);
             live = count <= 0 ? 0u : std::min<u32>(count, table.num_elements);
-            if (count > static_cast<s32>(table.num_elements) && !sharp_table_count_logged) {
-                sharp_table_count_logged = true;
+            if (count > static_cast<s32>(table.num_elements) && count_logged && !*count_logged) {
+                *count_logged = true;
                 LOG_WARNING(
                     Render_Recompiler,
                     "Workaround dynamic_tsharp_array_size: shader {:#x} loops over {} T#s of a "
@@ -31,9 +31,8 @@ void Info::RefreshSharpTables() {
             }
         }
         const u64 live_size = u64{live} * table.stride_dw * sizeof(u32);
-        const VAddr ptr = (VAddr{flattened_ud_buf[table.ptr_lo]} |
-                           VAddr{flattened_ud_buf[table.ptr_hi]} << 32) &
-                          AddressMask;
+        const VAddr ptr =
+            (VAddr{flat[table.ptr_lo]} | VAddr{flat[table.ptr_hi]} << 32) & AddressMask;
         const VAddr src = ptr + u64{table.offset_dw} * sizeof(u32);
         // Read only live entries through the backing under the memory manager lock; invalid pointers can hit free address space, and
         // reading an unbacked tail would fail the whole read; CPU writes keep the backing current

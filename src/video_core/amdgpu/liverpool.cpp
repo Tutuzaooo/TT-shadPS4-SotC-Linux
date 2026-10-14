@@ -150,7 +150,7 @@ u32 DelayUs() {
             LOG_WARNING(Render, "Workaround eop_label_delay_us enabled: gfx EOP labels {} us after "
                                 "the packet (crude timing patch)",
                         value);
-            if (EmulatorSettings.IsReadbackAhead()) {
+            if (EmulatorSettings.IsReadbackAheadOn()) {
                 LOG_WARNING(Render, "eop_label_delay_us with readback_ahead: the flicker it hides "
                                     "comes back with readback_ahead");
             }
@@ -299,6 +299,62 @@ void Dump(u32 count) {
 
 } // namespace CpHistory
 
+/// Allow register updates, draw and dispatch packets, nested buffers, CP-only syncs and waits while earlier draws record; CP waits drain
+/// only when queues stop progressing; all other packets drain first
+static bool PipelinedOpcode(const PM4Header* header, bool compute_queue) {
+    switch (header->type3.opcode.Value()) {
+    case PM4ItOpcode::Nop: // Markers drain in the rasterizer; flips drain before the interrupt
+    case PM4ItOpcode::IndirectBuffer:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+    case PM4ItOpcode::WaitRegMem:
+    case PM4ItOpcode::Rewind:
+    case PM4ItOpcode::PredExec:
+        return true;
+    case PM4ItOpcode::MemSemaphore:
+        return !reinterpret_cast<const PM4CmdMemSemaphore*>(header)->IsSignaling();
+    case PM4ItOpcode::DmaData:
+        // Ignore DMA writes to this register
+        return reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo == 0x3022C;
+    case PM4ItOpcode::EventWrite: {
+        // The occlusion query dump writes to guest memory
+        const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+        return compute_queue || event->event_index.Value() != EventIndex::ZpassDone;
+    }
+    case PM4ItOpcode::SetQueueReg:
+        return compute_queue;
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetPredication:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::IncrementDeCounter:
+    case PM4ItOpcode::WaitOnCeCounter: // The CE drains before its own DUMP_CONST_RAM and COND_EXEC
+    case PM4ItOpcode::PfpSyncMe:
+    case PM4ItOpcode::StrmoutBufferUpdate:
+        return !compute_queue;
+    default:
+        // Drain for fences, data writes and copies, LOD statistics, conditional execution and semaphore signals
+        return false;
+    }
+}
+
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
 
@@ -364,6 +420,10 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
+        // Guest commands such as readbacks, flips and protection changes use the caches and scheduler
+        if (rasterizer) {
+            rasterizer->DrainDrawPipe();
+        }
         callback();
     }
 }
@@ -376,6 +436,7 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
     Common::PerfStats::MarkGpuThread();
     Common::CpProfiler::RegisterCurrentThread();
+    Vulkan::DrawPipe::MarkStageA();
 
     while (!stoken.stop_requested()) {
         {
@@ -427,6 +488,10 @@ void Liverpool::Process(std::stop_token stoken) {
         }
 
         if (submit_done) {
+            // Record every draw before closing the frame capture
+            if (rasterizer) {
+                rasterizer->DrainDrawPipe();
+            }
             VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
@@ -441,7 +506,15 @@ void Liverpool::Process(std::stop_token stoken) {
                                        .count());
         }
 
+        // Record all decoded draws before reporting GPU idle because the guest may free their memory
+        if (rasterizer) {
+            rasterizer->DrainDrawPipe();
+        }
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+    }
+    // Drain all packets before stopping the command processor
+    if (rasterizer) {
+        rasterizer->DrainDrawPipe();
     }
 }
 
@@ -478,6 +551,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
             const u32 size = dump_const->Size();
             if (rasterizer) {
+                // Drain before copying to guest memory below
+                rasterizer->DrainDrawPipe();
                 auto& buffer_cache = rasterizer->GetBufferCache();
                 if (buffer_cache.IsRegionInSyncBatch(dump_const->Address<VAddr>(), size)) {
                     buffer_cache.FlushSyncBatch();
@@ -520,6 +595,10 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::CondExec: {
             const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
+            // Drain before reading a condition that a pending packet may write; DE and ASC do this too
+            if (rasterizer) {
+                rasterizer->DrainDrawPipe();
+            }
             if (CondExecSkips(cond_exec, "CE")) {
                 ccb = NextPacket(ccb, header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
                 continue;
@@ -580,6 +659,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             if (CpHistory::Enabled()) {
                 CpHistory::RecordPacket(CpHistory::Queue::De, dcb);
             }
+            ++cp_progress;
+            if (rasterizer && rasterizer->DrawPipeBusy() && !PipelinedOpcode(header, false)) {
+                rasterizer->DrainDrawPipe();
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -589,8 +672,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
                 switch (nop->data_block[0]) {
                 case PM4CmdNop::PayloadType::PatchedFlip: {
-                    // There is no evidence that GPU CP drives flip events by parsing
-                    // special NOP packets. For convenience lets assume that it does.
+                    // Assume special NOP packets trigger flips for convenience; the interrupt handler prepares the frame using the texture
+                    // cache and scheduler, so drain first
+                    if (rasterizer) {
+                        rasterizer->DrainDrawPipe();
+                    }
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                     break;
                 }
@@ -1204,6 +1290,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     mem_semaphore->Signal();
                 } else {
                     while (!mem_semaphore->Signaled()) {
+                        if (rasterizer) {
+                            rasterizer->DrainForCpWait(cp_progress);
+                        }
                         YIELD_GFX();
                     }
                     mem_semaphore->Decrement();
@@ -1227,6 +1316,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
                 while (!rewind->Valid()) {
+                    rasterizer->DrainForCpWait(cp_progress);
                     YIELD_GFX();
                 }
                 break;
@@ -1256,11 +1346,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
                     const Common::PerfStats::ScopedNs perf_timer{Common::PerfStats::Id::CpVoWaitNs};
+                    // Drain before the thread sleeps here
+                    if (rasterizer) {
+                        rasterizer->DrainDrawPipe();
+                    }
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
                 while (!CpWaitPasses(wait_reg_mem, regs.reg_array)) {
                     Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
+                    if (rasterizer) {
+                        rasterizer->DrainForCpWait(cp_progress);
+                    }
                     YIELD_GFX();
                 }
                 break;
@@ -1407,6 +1504,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         if (CpHistory::Enabled()) {
             CpHistory::RecordPacket(static_cast<s16>(vqid), acb);
         }
+        ++cp_progress;
+        if (rasterizer && rasterizer->DrawPipeBusy() && !PipelinedOpcode(header, true)) {
+            rasterizer->DrainDrawPipe();
+        }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1489,6 +1590,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
             while (!rewind->Valid()) {
+                rasterizer->DrainForCpWait(cp_progress);
                 YIELD_ASC(vqid);
             }
             break;
@@ -1604,6 +1706,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 mem_semaphore->Signal();
             } else {
                 while (!mem_semaphore->Signaled()) {
+                    if (rasterizer) {
+                        rasterizer->DrainForCpWait(cp_progress);
+                    }
                     YIELD_ASC(vqid);
                 }
                 mem_semaphore->Decrement();
@@ -1628,6 +1733,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             while (!CpWaitPasses(wait_reg_mem, regs.reg_array)) {
                 Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
+                if (rasterizer) {
+                    rasterizer->DrainForCpWait(cp_progress);
+                }
                 YIELD_ASC(vqid);
             }
             break;

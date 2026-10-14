@@ -14,6 +14,7 @@
 #include "common/logging/log.h"
 #include "common/perf_stats.h"
 #include "common/thread.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_recorder.h"
 
 #if defined(_M_X64) || defined(__x86_64__)
@@ -693,9 +694,16 @@ void CommandRecorder::CheckProducer() {
         producer_tid = tid;
         return;
     }
-    UNREACHABLE_MSG("cp_record_thread: thread {} records on the scheduler of thread {}; the command "
-                    "stream has one producer",
-                    tid, producer_tid);
+    // The command processor and recording thread take turns, switching through pipe drains
+    if (DrawPipe::ProducerHandOffAllowed()) {
+        producer_tid = tid;
+        return;
+    }
+    UNREACHABLE_MSG(
+        "cp_record_thread: thread {} records on the scheduler of thread {}; the command "
+        "stream has one producer{}",
+        tid, producer_tid,
+        DrawPipe::OnStageA() ? " (draw_pipe: stage A records with packets in flight)" : "");
 }
 
 void CommandRecorder::ClaimProducer() {

@@ -22,6 +22,7 @@
 #include "core/signals.h"
 #include "shader_recompiler/ir/passes/srt.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 #ifndef _WIN64
@@ -148,6 +149,11 @@ struct PageManager::Impl {
     }
 
     virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
+
+    /// Handle recording-thread faults on that thread as the cache owner
+    virtual bool HandlesDrawRecordThread() const {
+        return false;
+    }
 
     void EnsurePages(VAddr begin, VAddr end) {
         end = std::min(end, VAddr{1} << ADDRESS_BITS) - 1;
@@ -500,6 +506,10 @@ struct SignalImpl : public PageManager::Impl {
                                                                   priority);
     }
 
+    bool HandlesDrawRecordThread() const override {
+        return true;
+    }
+
     /// SHADPS4_PERF_STATS: time spent changing protections, all threads and command processor thread only
     /// (re-protection after uploads runs there)
     struct ProtectTimer {
@@ -591,14 +601,17 @@ struct SignalImpl : public PageManager::Impl {
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        // The recording thread owns the caches while active; guest-thread readbacks go through the command processor, which may be waiting
+        // for it
+        const bool on_stage_b = Vulkan::DrawPipe::OnStageB();
         const auto is_gpu_thread =
-            std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+            on_stage_b || std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         const bool is_write = Common::IsWriteError(context);
         const bool perf = Common::PerfStats::Enabled();
         const auto start =
             perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (!is_write && is_gpu_thread && EmulatorSettings.IsSrtWalkerCleanReads() &&
-            TryCleanWalkerRead(context, addr)) {
+        if (!is_write && is_gpu_thread && !on_stage_b &&
+            EmulatorSettings.IsSrtWalkerCleanReadsOn() && TryCleanWalkerRead(context, addr)) {
             if (perf) {
                 using namespace Common::PerfStats;
                 Add(Id::SrtCleanReads);
@@ -654,7 +667,11 @@ struct SignalImpl : public PageManager::Impl {
 
     /// Clean-load callback used by generated walkers before the normal fault path
     static bool PS4_SYSV_ABI SrtWalkerCleanLoad(u64 address, u32 size, u64* out) {
-        if (!EmulatorSettings.IsSrtWalkerCleanReads() || !Common::PerfStats::IsGpuThread()) {
+        // An SRT walk waits for pending writes to its buffer, then uses a normal load that can fault on the updated page marks
+        if (Vulkan::DrawPipe::OnStageA()) {
+            rasterizer->PipeNetLoad(address, size);
+        }
+        if (!EmulatorSettings.IsSrtWalkerCleanReadsOn() || !Common::PerfStats::IsGpuThread()) {
             return false;
         }
         u64 value = 0;
@@ -759,6 +776,10 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 }
 
 PageManager::~PageManager() = default;
+
+bool PageManager::HandlesDrawRecordThread() const {
+    return impl->HandlesDrawRecordThread();
+}
 
 std::pair<u32, u32> PageManager::GetWatchers(VAddr addr) const {
     const auto* state = impl->cached_pages.find(addr >> PM_PAGE_BITS);

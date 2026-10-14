@@ -683,6 +683,8 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    // This runs on the command processor for flips or EOP flip interrupts and uses the texture cache, runtime and draw scheduler
+    rasterizer->DrainDrawPipe();
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
@@ -793,6 +795,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 }
 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
+    if (!present_thread) {
+        // The command processor uses the draw scheduler here
+        rasterizer->DrainDrawPipe();
+    }
     // Request a free presentation frame.
     Frame* frame = GetRenderFrame();
 

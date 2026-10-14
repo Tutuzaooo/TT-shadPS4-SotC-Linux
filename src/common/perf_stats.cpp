@@ -164,6 +164,19 @@ constexpr std::array<Field, static_cast<size_t>(Id::Count)> Fields{{
     {Id::FillHleReadbacks, "fill_hle_readbacks", Unit::Count},
     {Id::FillHleVerifyChecks, "fill_hle_verify", Unit::Count},
     {Id::FillHleVerifyMismatches, "fill_hle_mismatches", Unit::Count},
+    {Id::PipePackets, "pipe_packets", Unit::Count},
+    {Id::PipeDrains, "pipe_drains", Unit::Count},
+    {Id::PipeDrainNs, "pipe_drain_ms", Unit::Ms},
+    {Id::PipeBusyNs, "pipe_busy_ms", Unit::Ms},
+    {Id::PipePackNs, "pipe_pack_ms", Unit::Ms},
+    {Id::PipeNetRanges, "pipe_net_ranges", Unit::Count},
+    {Id::PipeNetNs, "pipe_net_ms", Unit::Ms},
+    {Id::PipeNetInFlight, "pipe_net_inflight", Unit::Count},
+    {Id::PipeNetLoads, "pipe_net_loads", Unit::Count},
+    {Id::PipeNetWaits, "pipe_net_waits", Unit::Count},
+    {Id::PipeLazyWaits, "pipe_lazy_waits", Unit::Count},
+    {Id::PipeVerifyChecks, "pipe_verify_checks", Unit::Count},
+    {Id::PipeVerifyMismatches, "pipe_verify_mismatches", Unit::Count},
 }};
 
 constexpr bool FieldsMatchIds() {

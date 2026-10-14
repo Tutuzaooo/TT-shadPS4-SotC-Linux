@@ -222,6 +222,8 @@ private:
     u32 num_mapped_queues{1u}; // GFX is always available
 
     VAddr indirect_args_addr{};
+    /// Count packets decoded across all queues for Rasterizer::DrainForCpWait
+    u64 cp_progress{};
     u32 num_counter_pairs{};
     u64 pixel_counter{};
 

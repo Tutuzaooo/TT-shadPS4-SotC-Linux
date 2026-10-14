@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <bit>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <set>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <fmt/ranges.h>
 
 #include "common/debug.h"
@@ -535,7 +537,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       }()},
       replicate_fill_hle{EmulatorSettings.IsReplicateFillHle()},
       fill_hle_toggle{Common::PerfStats::AbToggleFollows("replicate_fill_hle")},
-      fill_hle_verify{replicate_fill_hle && std::getenv("SHADPS4_FILL_HLE_VERIFY") != nullptr} {
+      fill_hle_verify{replicate_fill_hle && std::getenv("SHADPS4_FILL_HLE_VERIFY") != nullptr},
+      net_enabled{EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise &&
+                  Shader::GetSrtWalkerContext() &&
+                  Shader::GetSrtWalkerContext()->clean_pages != nullptr},
+      draw_pipe_toggle{Common::PerfStats::AbToggleFollows("draw_pipe")} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -558,6 +564,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 
     scheduler.SetSessionCallback([this] { buffer_cache.FlushSyncBatch(true); });
     pipeline_cache.read_clean_memory = [this](VAddr addr, void* out, u64 size) {
+        // The recording thread owns the clean-page cache while packets are pending
+        if (DrawPipe::OnStageA() && DrawPipeBusy()) {
+            return ReadCodeMemory(addr, out, size);
+        }
         return ReadCleanMemory(addr, out, size);
     };
     pipeline_cache.is_null_image = [this](const AmdGpu::Image& tsharp,
@@ -584,7 +594,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (periodic_flush_commands != 0) {
         LOG_WARNING(Render_Vulkan, "Workaround periodic_flush_commands enabled: submit every {} commands",
                     periodic_flush_commands);
-        if (!EmulatorSettings.IsReadbackAhead()) {
+        if (!EmulatorSettings.IsReadbackAheadOn()) {
             LOG_WARNING(Render_Vulkan, "periodic_flush_commands without readback_ahead: one device "
                                        "loss (WriteInvalid) was seen in this combination");
         }
@@ -619,6 +629,32 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         LOG_WARNING(Render_Vulkan, "Draw packet verify every {} packets", pipe_verify_interval);
     }
     scheduler.SkipRedundantPipelineBinds(EmulatorSettings.IsGpuOverheadCuts());
+    // A/B runs need the recording thread even when draw_pipe starts disabled; create it after everything it uses
+    if (EmulatorSettings.IsDrawPipe() || Common::PerfStats::AbToggleLists("draw_pipe")) {
+        if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise) {
+            // Precise readbacks protect GPU-written pages against reads, as required by pending-write checks and fault drains
+            LOG_WARNING(Render_Vulkan,
+                        "Workaround draw_pipe ignored: it needs readbacks_mode Precise (2)");
+        } else if (!page_manager.HandlesDrawRecordThread()) {
+            LOG_WARNING(Render_Vulkan, "Workaround draw_pipe ignored: userfaultfd memory tracking "
+                                       "does not handle faults on the draw recording thread");
+        } else {
+            draw_pipe = std::make_unique<DrawPipe>(&Rasterizer::RunPipePacket, this);
+            LOG_WARNING(Render_Vulkan, "Workaround draw_pipe enabled{}{}{}",
+                        EmulatorSettings.IsDrawPipe() ? "" : " (A/B toggle only)",
+                        net_enabled ? "" : " (no safety net: no clean-page bitmap)",
+                        pipe_verify_interval != 0 ? " (verify)" : "");
+        }
+        // IsSrtWalkerCleanReadsOn and IsReadbackAheadOn disable these while draw_pipe is enabled
+        const char* const off =
+            EmulatorSettings.IsDrawPipe() ? "turned off for this run" : "keep it off for the A/B";
+        if (EmulatorSettings.IsSrtWalkerCleanReads()) {
+            LOG_WARNING(Render_Vulkan, "draw_pipe: srt_walker_clean_reads {}", off);
+        }
+        if (EmulatorSettings.IsReadbackAhead()) {
+            LOG_WARNING(Render_Vulkan, "draw_pipe: readback_ahead {}", off);
+        }
+    }
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -708,6 +744,20 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     using DrawPacket::Align;
     constexpr u32 BlockBytes = AmdGpu::RegDirty::BlockWords * sizeof(u32);
     auto& dirty = liverpool->reg_dirty;
+    const bool in_pipe = UsePipe();
+    if (packet_in_pipe && !in_pipe) {
+        // Drain earlier packets before this inline packet when SHADPS4_AB_TOGGLE disables draw_pipe
+        DrainDrawPipe();
+    }
+    packet_in_pipe = in_pipe;
+    const Common::PerfStats::ScopedNs pack_timer{Common::PerfStats::Id::PipePackNs};
+    if (in_pipe && net_enabled && pipeline) {
+        const Common::PerfStats::ScopedNs net_timer{Common::PerfStats::Id::PipeNetNs};
+        CollectNetRanges(pipeline);
+    }
+    // Decide here whether verification needs the full register file on stage B
+    const bool verify =
+        pipe_verify_interval != 0 && ++pipe_verify_packets % pipe_verify_interval == 0;
     const u32 num_blocks = dirty.NumDirty();
     const bool has_cs =
         kind == DrawPacket::Kind::Dispatch || kind == DrawPacket::Kind::DispatchIndirect;
@@ -728,12 +778,21 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     if (has_cs) {
         size += Align(sizeof(AmdGpu::ComputeProgram));
     }
-    if (size > packet_capacity) {
-        packet_capacity = std::max(size, packet_capacity * 2);
-        packet_buffer = std::make_unique_for_overwrite<u64[]>(packet_capacity / sizeof(u64));
+    if (verify) {
+        size += Align(sizeof(AmdGpu::Regs));
     }
+    u8* data;
+    if (in_pipe) {
+        data = draw_pipe->Begin(size);
+    } else {
+        if (size > packet_capacity) {
+            packet_capacity = std::max(size, packet_capacity * 2);
+            packet_buffer = std::make_unique_for_overwrite<u64[]>(packet_capacity / sizeof(u64));
+        }
+        data = reinterpret_cast<u8*>(packet_buffer.get());
+    }
+    packet_data = data;
 
-    u8* const data = reinterpret_cast<u8*>(packet_buffer.get());
     auto& packet = *std::construct_at(reinterpret_cast<DrawPacket::Header*>(data));
     packet.size = size;
     packet.kind = kind;
@@ -744,6 +803,8 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     packet.unordered_ring = -1;
     packet.fill_hle = fill_hle_next;
     fill_hle_next = false;
+    packet.verify = verify;
+    packet.game_sync_rings = std::exchange(pending_game_sync, u16{0});
     packet.pipeline = pipeline;
     packet.cb_extent = liverpool->last_cb_extent;
     packet.db_extent = liverpool->last_db_extent;
@@ -780,14 +841,100 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
         std::memcpy(out, &liverpool->GetCsRegs(), sizeof(AmdGpu::ComputeProgram));
         out += Align(sizeof(AmdGpu::ComputeProgram));
     }
+    if (verify) {
+        std::memcpy(out, &liverpool->regs, sizeof(AmdGpu::Regs));
+        out += Align(sizeof(AmdGpu::Regs));
+    }
     ASSERT(static_cast<u32>(out - data) == size);
     return packet;
 }
 
-void Rasterizer::RunPacket() {
+void Rasterizer::CollectNetRanges(const Pipeline* pipeline) {
+    // Track buffer ranges BindBuffers will write using the packet's live user data; only pages not already marked GPU-modified need
+    // tracking here, since marked pages fault and drain
+    PruneNet();
+    const u64 packet = draw_pipe->NextPacket();
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        const Shader::UdView ud{*stage};
+        for (const auto& desc : stage->buffers) {
+            if (!desc.is_written || desc.IsSpecial()) {
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(ud);
+            if (vsharp.base_address <= 1 || vsharp.GetSize() == 0 ||
+                !IsMapped(vsharp.base_address, 1)) {
+                continue;
+            }
+            const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+            if (size == 0 ||
+                buffer_cache.IsRegionFullyGpuModifiedTracked(vsharp.base_address, size)) {
+                continue;
+            }
+            // Keep the later packet number when a buffer is written again before the first write runs
+            const auto same = std::ranges::find_if(net_pending, [&](const NetRange& range) {
+                return range.addr == vsharp.base_address && range.size >= size;
+            });
+            if (same != net_pending.end()) {
+                same->packet = packet;
+                Common::PerfStats::Add(Common::PerfStats::Id::PipeNetInFlight);
+                continue;
+            }
+            Shader::SetSrtCleanPages(vsharp.base_address, size, true);
+            net_pending.push_back({vsharp.base_address, size, packet});
+            Common::PerfStats::Add(Common::PerfStats::Id::PipeNetRanges);
+        }
+    }
+}
+
+void Rasterizer::PruneNet() {
+    while (!net_pending.empty() && draw_pipe->ReachedPacket(net_pending.front().packet)) {
+        net_to_clear.emplace_back(net_pending.front().addr, net_pending.front().size);
+        net_pending.pop_front();
+    }
+    // Clear shared page bits only after all pending ranges finish; stale bits merely add a walker callback
+    if (net_pending.empty() && !net_to_clear.empty()) {
+        for (const auto& [addr, size] : net_to_clear) {
+            Shader::SetSrtCleanPages(addr, size, false);
+        }
+        net_to_clear.clear();
+    }
+}
+
+void Rasterizer::PipeNetLoad(VAddr addr, u32 size) {
+    if (!draw_pipe || net_pending.empty()) {
+        return;
+    }
+    Common::PerfStats::Add(Common::PerfStats::Id::PipeNetLoads);
+    PruneNet();
+    const bool pending = std::ranges::any_of(net_pending, [&](const NetRange& range) {
+        return addr < range.addr + range.size && range.addr < addr + size &&
+               !draw_pipe->ReachedPacket(range.packet);
+    });
+    if (pending) {
+        Common::PerfStats::Add(Common::PerfStats::Id::PipeNetWaits);
+        DrainDrawPipe();
+        PruneNet();
+    }
+}
+
+void Rasterizer::SubmitPacket() {
+    if (packet_in_pipe) {
+        draw_pipe->Commit();
+    } else {
+        RunPacket(packet_data);
+    }
+}
+
+void Rasterizer::RunPipePacket(void* context, const u8* data, u32 /*size*/) {
+    static_cast<Rasterizer*>(context)->RunPacket(data);
+}
+
+void Rasterizer::RunPacket(const u8* data) {
     using DrawPacket::Align;
     constexpr u32 BlockWords = AmdGpu::RegDirty::BlockWords;
-    const u8* const data = reinterpret_cast<const u8*>(packet_buffer.get());
     const auto& packet = *reinterpret_cast<const DrawPacket::Header*>(data);
 
     const u8* in = data + Align(sizeof(DrawPacket::Header));
@@ -818,15 +965,24 @@ void Rasterizer::RunPacket() {
         cs = reinterpret_cast<const AmdGpu::ComputeProgram*>(in);
         in += Align(sizeof(AmdGpu::ComputeProgram));
     }
+    const AmdGpu::Regs* verify_regs = nullptr;
+    if (packet.verify) {
+        verify_regs = reinterpret_cast<const AmdGpu::Regs*>(in);
+        in += Align(sizeof(AmdGpu::Regs));
+    }
     ASSERT(static_cast<u32>(in - data) == packet.size);
     stage_regs = pipe_regs.get();
     stage_cs = cs;
     pipe_cb_extent = packet.cb_extent;
     pipe_db_extent = packet.db_extent;
-    if (pipe_verify_interval != 0 && ++pipe_verify_packets % pipe_verify_interval == 0) {
-        VerifyPacket(packet);
+    if (verify_regs) {
+        VerifyPacket(packet, *verify_regs);
     }
 
+    // Apply guest syncs between packets in command order for gcn_unordered_dispatches
+    for (u32 rings = packet.game_sync_rings; rings != 0; rings &= rings - 1) {
+        runtime.OnGameSync(static_cast<u8>(std::countr_zero(rings)));
+    }
     if (packet.compute) {
         unordered_ring = packet.unordered_ring;
     }
@@ -862,50 +1018,112 @@ void Rasterizer::RunPacket() {
     stage_cs = nullptr;
 }
 
-void Rasterizer::VerifyPacket(const DrawPacket::Header& packet) {
-    // Both stages run on one thread here, so every captured value must match the live state
+namespace {
+/// Rerun the SRT walk from packet user data for SHADPS4_PIPE_VERIFY; the walker handles its own faults, and this guard catches invalid
+/// pointers outside tracked memory
+[[gnu::noinline]] void BuildFlat(const Shader::Info& info, std::span<const u32> ud,
+                                 std::vector<u32>& out) {
+    info.BuildFlatBuf(ud, out);
+}
+
+bool TryBuildFlat(const Shader::Info& info, std::span<const u32> ud, std::vector<u32>& out) {
+#ifdef _WIN32
+    __try {
+        BuildFlat(info, ud, out);
+        return true;
+    } __except (1 /* EXCEPTION_EXECUTE_HANDLER */) {
+        return false;
+    }
+#else
+    BuildFlat(info, ud, out);
+    return true;
+#endif
+}
+} // Anonymous namespace
+
+void Rasterizer::VerifyPacket(const DrawPacket::Header& packet, const AmdGpu::Regs& packed) {
+    // Apply changed blocks, then compare stage B's registers with the captured file
     ++pipe_verify_checks;
+    Common::PerfStats::Add(Common::PerfStats::Id::PipeVerifyChecks);
     std::string what;
-    const auto& live = liverpool->regs.reg_array;
     const auto& copy = pipe_regs->reg_array;
-    if (std::memcmp(live.data(), copy.data(), sizeof(live)) != 0) {
+    if (std::memcmp(packed.reg_array.data(), copy.data(), sizeof(copy)) != 0) {
         u32 word = 0;
-        while (live[word] == copy[word]) {
+        while (packed.reg_array[word] == copy[word]) {
             ++word;
         }
-        what = fmt::format("register word {:#x} (live {:#x}, copy {:#x})", word, live[word],
-                           copy[word]);
-    } else if (std::memcmp(packet.cb_extent.data(), liverpool->last_cb_extent.data(),
-                           sizeof(packet.cb_extent)) != 0 ||
-               packet.db_extent.raw != liverpool->last_db_extent.raw) {
-        what = "CB/DB extent";
-    } else if (stage_cs && std::memcmp(stage_cs, &liverpool->GetCsRegs(),
-                                       sizeof(AmdGpu::ComputeProgram)) != 0) {
-        what = "compute program";
+        what = fmt::format("register word {:#x} (packed {:#x}, copy {:#x})", word,
+                           packed.reg_array[word], copy[word]);
+    } else if (!DrawPipe::OnStageB()) {
+        // Inline recording uses unchanged live state, so all captured values must match
+        if (std::memcmp(packet.cb_extent.data(), liverpool->last_cb_extent.data(),
+                        sizeof(packet.cb_extent)) != 0 ||
+            packet.db_extent.raw != liverpool->last_db_extent.raw) {
+            what = "CB/DB extent";
+        } else if (stage_cs && std::memcmp(stage_cs, &liverpool->GetCsRegs(),
+                                           sizeof(AmdGpu::ComputeProgram)) != 0) {
+            what = "compute program";
+        } else {
+            for (u32 i = 0; i < Shader::Info::num_ud_snapshots && what.empty(); ++i) {
+                const auto& snapshot = Shader::Info::ud_snapshots[i];
+                const auto& info = *snapshot.info;
+                const bool same =
+                    snapshot.pgm_base == info.pgm_base &&
+                    std::ranges::equal(std::span{snapshot.user_data, snapshot.user_data_size},
+                                       info.user_data) &&
+                    std::ranges::equal(std::span{snapshot.flat, snapshot.flat_size},
+                                       info.flattened_ud_buf);
+                if (!same) {
+                    what = fmt::format("user data of shader {:#x}", info.pgm_hash);
+                }
+            }
+        }
     } else {
+        // Rewalk SRTs after earlier packets finish and compare with stage A's flat buffer; differences can expose tables read before their
+        // GPU writes were marked
         for (u32 i = 0; i < Shader::Info::num_ud_snapshots && what.empty(); ++i) {
             const auto& snapshot = Shader::Info::ud_snapshots[i];
             const auto& info = *snapshot.info;
-            const bool same =
-                snapshot.pgm_base == info.pgm_base &&
-                std::ranges::equal(std::span{snapshot.user_data, snapshot.user_data_size},
-                                   info.user_data) &&
-                std::ranges::equal(std::span{snapshot.flat, snapshot.flat_size},
-                                   info.flattened_ud_buf);
-            if (!same) {
-                what = fmt::format("user data of shader {:#x}", info.pgm_hash);
+            if (!info.srt_info.walker_func && info.sharp_tables.empty()) {
+                continue;
+            }
+            ++pipe_verify_walks;
+            const std::span<const u32> ud{snapshot.user_data, snapshot.user_data_size};
+            if (!TryBuildFlat(info, ud, pipe_verify_flat)) {
+                what = fmt::format("SRT walk of shader {:#x} faulted", info.pgm_hash);
+            } else if (pipe_verify_flat.size() != snapshot.flat_size) {
+                what = fmt::format("SRT walk of shader {:#x}: {} dwords, packed {}", info.pgm_hash,
+                                   pipe_verify_flat.size(), snapshot.flat_size);
+            } else {
+                for (u32 dword = 0; dword < snapshot.flat_size; ++dword) {
+                    if (pipe_verify_flat[dword] != snapshot.flat[dword]) {
+                        what = fmt::format(
+                            "SRT walk of shader {:#x}: flat dword {} walked {:#x}, packed {:#x}",
+                            info.pgm_hash, dword, pipe_verify_flat[dword], snapshot.flat[dword]);
+                        break;
+                    }
+                }
+            }
+            if (!what.empty()) {
+                ++pipe_verify_walk_mismatches;
             }
         }
     }
-    if (!what.empty() && ++pipe_verify_mismatches <= 32) {
-        LOG_ERROR(Render_Vulkan, "Draw packet verify: {} differs from the live state (kind {})",
-                  what, static_cast<u32>(packet.kind));
+    if (!what.empty()) {
+        Common::PerfStats::Add(Common::PerfStats::Id::PipeVerifyMismatches);
+        if (++pipe_verify_mismatches <= 32) {
+            LOG_ERROR(Render_Vulkan, "Draw packet verify: {} (kind {}, frame {})", what,
+                      static_cast<u32>(packet.kind), DebugState.GetGnmFrameNum());
+        }
     }
     const auto now = std::chrono::steady_clock::now();
     if (now - pipe_verify_last_report >= std::chrono::seconds{60}) {
         pipe_verify_last_report = now;
-        LOG_WARNING(Render_Vulkan, "Draw packet verify: {} packets checked, {} mismatches",
-                    pipe_verify_checks, pipe_verify_mismatches);
+        LOG_WARNING(Render_Vulkan,
+                    "Draw packet verify: {} packets checked, {} mismatches; {} SRT walks redone, "
+                    "{} differ",
+                    pipe_verify_checks, pipe_verify_mismatches, pipe_verify_walks,
+                    pipe_verify_walk_mismatches);
     }
 }
 
@@ -1124,9 +1342,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Draws,
                                                     Common::PerfStats::Id::DrawNs};
     NoteRingCommand(false);
+    if (DrawTrace::Instance().Active()) {
+        // Drain before the trace reads the buffer cache and page manager
+        DrainDrawPipe();
+    }
 
     DrawPrepare(is_indexed, index_offset);
-    RunPacket();
+    SubmitPacket();
 }
 
 void Rasterizer::DrawPrepare(bool is_indexed, u32 index_offset) {
@@ -1227,10 +1449,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Draws,
                                                     Common::PerfStats::Id::DrawNs};
     NoteRingCommand(false);
+    if (DrawTrace::Instance().Active()) {
+        DrainDrawPipe();
+    }
 
     DrawIndirectPrepare(is_indexed, arg_address, offset, stride, max_count, count_address,
                         vertex_sgpr_offset, instance_sgpr_offset);
-    RunPacket();
+    SubmitPacket();
 }
 
 void Rasterizer::DrawIndirectPrepare(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -1362,7 +1587,7 @@ void Rasterizer::DispatchDirect() {
     const s8 ring = NoteRingCommand(true);
 
     DispatchPrepare(false, 0, 0, ring);
-    RunPacket();
+    SubmitPacket();
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -1372,7 +1597,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const s8 ring = NoteRingCommand(true);
 
     DispatchPrepare(true, address + offset, size, ring);
-    RunPacket();
+    SubmitPacket();
 }
 
 void Rasterizer::DispatchPrepare(bool indirect, VAddr address, u32 size, s8 ring) {
@@ -1385,6 +1610,10 @@ void Rasterizer::DispatchPrepare(bool indirect, VAddr address, u32 size, s8 ring
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     const bool game_accesses = gcn_unordered_dispatches && !cs.uses_dma;
+    if (DrawTrace::Instance().Active() || AmdGpu::CpHistory::Enabled()) {
+        // Drain before the trace and ProbeStaleCbuf read the buffer cache and page manager
+        DrainDrawPipe();
+    }
     if (DrawTrace::Instance().Active()) {
         TraceCompute(cs, cs_program, indirect ? "DispatchIndirect" : "Dispatch", memory,
                      buffer_cache, page_manager);
@@ -1668,6 +1897,7 @@ void Rasterizer::CaptureBufferHeads() {
 }
 
 u64 Rasterizer::Flush() {
+    DrainDrawPipe();
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
@@ -1675,10 +1905,13 @@ u64 Rasterizer::Flush() {
 }
 
 void Rasterizer::Finish() {
+    DrainDrawPipe();
     scheduler.Finish();
 }
 
 void Rasterizer::OnSubmit() {
+    // Run garbage collection and frame ticks while the cache owner is idle
+    DrainDrawPipe();
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
@@ -1686,6 +1919,7 @@ void Rasterizer::OnSubmit() {
 }
 
 void Rasterizer::OnFence() {
+    DrainDrawPipe();
     texture_cache.ProcessDownloadImages();
     buffer_cache.FlushSyncBatch();
 }
@@ -1908,7 +2142,36 @@ void Rasterizer::OnGameSync() {
         return;
     }
     ring_synced[command_ring] = true;
+    if (DrawPipeBusy()) {
+        // Queue guest syncs for the next packet or drain because stage B owns runtime hazard state while recording
+        pending_game_sync |= static_cast<u16>(1u << command_ring);
+        return;
+    }
+    if (pending_game_sync != 0) {
+        ApplyPendingGameSync();
+    }
     runtime.OnGameSync(command_ring);
+}
+
+void Rasterizer::ApplyPendingGameSync() {
+    static_assert(MaxCommandRings <= 16, "pending_game_sync has a bit per ring");
+    for (u32 rings = std::exchange(pending_game_sync, u16{0}); rings != 0; rings &= rings - 1) {
+        runtime.OnGameSync(static_cast<u8>(std::countr_zero(rings)));
+    }
+}
+
+void Rasterizer::DrainForCpWait(u64 cp_progress) {
+    if (DrawPipeBusy()) {
+        // A CP wait may depend on another queue's undecoded packet; yield while queues progress and drain only when no packet was decoded
+        // since the last unmet wait
+        if (cp_progress != cp_wait_progress) {
+            cp_wait_progress = cp_progress;
+            Common::PerfStats::Add(Common::PerfStats::Id::PipeLazyWaits);
+            return;
+        }
+        DrainDrawPipe();
+    }
+    cp_wait_progress = cp_progress;
 }
 
 void Rasterizer::VerifyIncrementalBind(bool matches, const char* kind, u64 pgm_hash, VAddr address) {
@@ -3186,6 +3449,7 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    DrainDrawPipe();
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
@@ -3214,6 +3478,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    DrainDrawPipe();
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
         !buffer_cache.IsRegionInSyncBatch(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
@@ -3254,6 +3519,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
+    DrainDrawPipe();
     auto* gds_buf = buffer_cache.GetGdsBuffer();
     u32 value;
     std::memcpy(&value, gds_buf->mapped_data.data() + gds_offset, sizeof(u32));
@@ -3261,6 +3527,8 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
 }
 
 bool Rasterizer::WriteLodStats(VAddr address, u32 num_bytes) {
+    // The recording thread owns lod_stats_uses
+    DrainDrawPipe();
     if (!lod_stats_enabled) {
         return false;
     }
@@ -3346,6 +3614,9 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
         return false;
     }
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::FaultWrite, addr, size);
+    // Command processor faults wait for the recording thread; faults on that owner thread need no drain, and guest faults request readbacks
+    // through commands
+    DrainDrawPipe();
     {
         const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Invalidates,
                                                         Common::PerfStats::Id::InvalidateBufferNs};
@@ -3357,6 +3628,7 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
 }
 
 void Rasterizer::ReleaseCpuAuthoritativeRange(VAddr addr, u64 size) {
+    DrainDrawPipe();
     if (IsMapped(addr, size)) {
         buffer_cache.ReleaseCpuAuthoritativeRange(addr, size);
     }
@@ -3370,6 +3642,7 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
         return false;
     }
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::FaultRead, addr, size);
+    DrainDrawPipe();
     buffer_cache.ReadMemory(addr, size, false, assume_locks);
     return true;
 }
@@ -3377,6 +3650,7 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
 bool Rasterizer::ReadCleanMemory(VAddr addr, void* out, u64 size) {
     // Page by page through the clean page cache of the buffer cache: SotC serves tens of thousands of these
     // per frame, too many for the mapped-range and backing lookups with their locks
+    DrainDrawPipe();
     using CleanRead = VideoCore::BufferCache::CleanRead;
     constexpr u64 PageSize = 4_KB;
     auto* dst = static_cast<u8*>(out);
@@ -3402,6 +3676,31 @@ bool Rasterizer::ReadCleanMemory(VAddr addr, void* out, u64 size) {
     static const bool verify = std::getenv("SHADPS4_CLEAN_READ_VERIFY") != nullptr;
     if (verify) {
         VerifyCleanRead(addr, out, size);
+    }
+    return true;
+}
+
+bool Rasterizer::ReadCodeMemory(VAddr addr, void* out, u64 size) {
+    // Read CPU-written shader code through the backing even when neighboring GPU data protects the page; cache the last backing page and
+    // invalidate it when the mapping generation changes
+    auto* dst = static_cast<u8*>(out);
+    for (VAddr current = addr, end = addr + size; current < end;) {
+        constexpr u64 PageSize = 4_KB;
+        const VAddr page_addr = Common::AlignDown(current, PageSize);
+        const u64 chunk = std::min(end, page_addr + PageSize) - current;
+        const u64 generation = buffer_cache.MappingGeneration();
+        if (page_addr != code_page_addr || generation != code_page_generation) {
+            code_page_backing = memory->GetBackingPointer(page_addr);
+            code_page_addr = page_addr;
+            code_page_generation = generation;
+        }
+        if (!code_page_backing) {
+            code_page_addr = ~VAddr{0};
+            return false;
+        }
+        std::memcpy(dst, code_page_backing + (current - page_addr), chunk);
+        current += chunk;
+        dst += chunk;
     }
     return true;
 }
@@ -3604,6 +3903,7 @@ bool Rasterizer::IsMappedCached(VAddr addr, VAddr end) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    DrainDrawPipe();
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::GpuMap, addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
@@ -3614,10 +3914,13 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
+    DrainDrawPipe();
     page_manager.OnGpuMap(addr, size);
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    // Guest threads call these too; draining there is a no-op
+    DrainDrawPipe();
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::GpuUnmap, addr, size);
     // Bump the mapping generation before removing the range as well as afterward
     // A bind reading it during removal must discard its cached answer, and an extra bump only
@@ -3915,6 +4218,7 @@ void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) 
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -3926,6 +4230,7 @@ void Rasterizer::ScopeMarkerEnd(bool from_guest) {
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.endDebugUtilsLabelEXT();
 }
@@ -3935,6 +4240,7 @@ void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),
@@ -3947,6 +4253,7 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
         (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
+    DrainDrawPipe();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.insertDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
         .pLabelName = str.data(),

@@ -16,6 +16,7 @@
 #include "common/io_file.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/perf_stats.h"
 #include "common/signal_context.h"
 #include "core/emulator_settings.h"
 #include "core/signals.h"
@@ -90,14 +91,17 @@ bool PS4_SYSV_ABI NoCleanLoad(u64, u32, u64*) {
 }
 
 u64* AllocateCleanPages() {
-    // Allocate the clean-page bitmap only when the feature is enabled
-    if (!EmulatorSettings.IsSrtWalkerCleanReads()) {
+    // Use the clean-page bitmap for srt_walker_clean_reads and pending draw-pipe writes, including A/B runs; bitmap availability affects
+    // walker code and its codegen key
+    if (!EmulatorSettings.IsSrtWalkerCleanReads() && !EmulatorSettings.IsDrawPipe() &&
+        !Common::PerfStats::AbToggleLists("draw_pipe")) {
         return nullptr;
     }
     auto* const pages = static_cast<u64*>(std::calloc(SrtCleanPageLimit >> 18, sizeof(u64)));
     if (!pages) {
-        LOG_ERROR(Render_Recompiler, "srt_walker_clean_reads: no memory for the clean-page bitmap, "
-                                     "walker loads fault as without the key");
+        LOG_ERROR(Render_Recompiler,
+                  "srt_walker_clean_reads/draw_pipe: no memory for the clean-page bitmap, walker "
+                  "loads fault as without the key and draw_pipe runs without its safety net");
     }
     return pages;
 }

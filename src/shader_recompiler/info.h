@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstring>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -262,7 +264,23 @@ struct Info : InfoPersistent {
     }
 
     /// Copies every SharpTable from guest memory into the flat buffer (zeros if unmapped)
-    void RefreshSharpTables();
+    void RefreshSharpTables() {
+        FillSharpTables(flattened_ud_buf.data(), &sharp_table_count_logged);
+    }
+    /// Refresh into flat and optionally log an out-of-range table count once through count_logged
+    void FillSharpTables(u32* flat, bool* count_logged) const;
+
+    /// SHADPS4_PIPE_VERIFY rebuilds the flat buffer from ud using current guest memory; walker loads may fault and trigger readbacks
+    void BuildFlatBuf(std::span<const u32> ud, std::vector<u32>& out) const {
+        out.assign(srt_info.flattened_bufsize_dw, 0);
+        std::memcpy(out.data(), ud.data(), std::min<size_t>(ud.size(), out.size()) * sizeof(u32));
+        if (srt_info.walker_func) {
+            srt_info.walker_func(ud.data(), out.data(), 0, 0, GetSrtWalkerContext());
+        }
+        if (!sharp_tables.empty()) {
+            FillSharpTables(out.data(), nullptr);
+        }
+    }
 
     /// Flat buffer dwords that hold sharp tables rather than SRT walker output
     u32 SharpTableDwords() const noexcept {

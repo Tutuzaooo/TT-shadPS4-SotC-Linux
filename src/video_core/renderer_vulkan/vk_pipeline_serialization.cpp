@@ -15,10 +15,10 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Binary 6 adds walker recovery, descriptor tolerance for 10_11_11 and add_tid, and DMA bitmap bounds checks and atomics; meta 6 adds the
 // codegen key and uses_loop_cap; meta 7 adds early_fragment_tests, sharp_tables and image array fields; meta 8 changes SharpFetch and
-// FetchShaderData for #5112 and one_vgprs; meta 9 adds clean-page checks for srt_walker_clean_reads; binary 7 limits Flat subgroup inputs
-// to fragment shaders; binary 8 includes ISA fixes #5030, #5031, #5141, #5185, #5186, #5194, #5199, #5200 and #5202; meta 10 adds count_loc
-// and graphics T# arrays; meta 11 replaces unreleased meta 10, uses UNKNOWN_LOCATION for missing bounds and requires a flat loop-header
-// bound for graphics tables
+// FetchShaderData for #5112 and one_vgprs; meta 9 adds clean-page checks for srt_walker_clean_reads or draw_pipe; binary 7 limits Flat
+// subgroup inputs to fragment shaders; binary 8 includes ISA fixes #5030, #5031, #5141, #5185, #5186, #5194, #5199, #5200 and #5202; meta
+// 10 adds count_loc and graphics T# arrays; meta 11 replaces unreleased meta 10, uses UNKNOWN_LOCATION for missing bounds and requires a
+// flat loop-header bound for graphics tables
 static constexpr u32 ShaderBinaryVersion = 8u;
 static constexpr u32 ShaderMetaVersion = 11u;
 static constexpr u32 PipelineKeyVersion = 3u;
@@ -34,6 +34,13 @@ constexpr u32 RelativeInstanceIdBit = 47;
 constexpr u32 GcnNanSemanticsBit = 48;
 constexpr u32 LegacyMadSemanticsBit = 49;
 
+/// Bitmap availability changes cached walker code for srt_walker_clean_reads and draw_pipe; walkers with clean-page checks require a valid
+/// bitmap
+bool SrtWalkerCleanLoads() {
+    const auto* context = Shader::GetSrtWalkerContext();
+    return context && context->clean_pages != nullptr;
+}
+
 u64 CodegenSettingsKey() {
     return u64{EmulatorSettings.GetComputeLoopCap()} |
            (u64{EmulatorSettings.IsDirectMemoryAccessEnabled()} << 32) |
@@ -42,7 +49,7 @@ u64 CodegenSettingsKey() {
            (u64{Shader::DynamicTsharpArraySize()} << 35) | // 7 bits, at most 64
            (u64{EmulatorSettings.IsWave64UniformBranches()} << 42) |
            (u64{EmulatorSettings.IsInlineFetchShader()} << 43) |
-           (u64{EmulatorSettings.IsSrtWalkerCleanReads()} << 44) | // SRT walker code
+           (u64{SrtWalkerCleanLoads()} << 44) | // SRT walker code key
            (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45) |
            (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit) |
            (u64{EmulatorSettings.IsRelativeInstanceId()} << RelativeInstanceIdBit) |

@@ -9,7 +9,7 @@
 
 namespace Shader {
 
-void Info::RefreshSharpTables() {}
+void Info::FillSharpTables(u32* flat, bool* count_logged) const {}
 
 u32 DynamicTsharpArraySize() {
     return 0;
