@@ -681,6 +681,10 @@ VkCommandBuffer CommandRecorder::Real(VkCommandBuffer fake) const noexcept {
 
 void CommandRecorder::CheckProducer() {
     static thread_local const u32 tid = CurrentThreadId();
+    // Check for a drain before the producer test, which misses stage A overlap when stage A was already the producer
+    if (DrawPipe::OnStageA() && !DrawPipe::StageAMayRecord()) [[unlikely]] {
+        UNREACHABLE_MSG("cp_record_thread: draw_pipe stage A records with packets in flight");
+    }
     if (tid == producer_tid) [[likely]] {
         return;
     }
@@ -701,9 +705,8 @@ void CommandRecorder::CheckProducer() {
     }
     UNREACHABLE_MSG(
         "cp_record_thread: thread {} records on the scheduler of thread {}; the command "
-        "stream has one producer{}",
-        tid, producer_tid,
-        DrawPipe::OnStageA() ? " (draw_pipe: stage A records with packets in flight)" : "");
+        "stream has one producer",
+        tid, producer_tid);
 }
 
 void CommandRecorder::ClaimProducer() {

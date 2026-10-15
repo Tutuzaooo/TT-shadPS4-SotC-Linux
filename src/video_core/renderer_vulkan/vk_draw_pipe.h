@@ -41,6 +41,12 @@ public:
         const DrawPipe* pipe = active.load(std::memory_order_acquire);
         return pipe && (on_stage_b || (on_stage_a && pipe->Idle()));
     }
+    /// Check every stage A recording command for a drained pipe, regardless of the last producer; ProducerHandOffAllowed catches only
+    /// producer changes
+    [[nodiscard]] static bool StageAMayRecord() noexcept {
+        const DrawPipe* pipe = active.load(std::memory_order_acquire);
+        return !pipe || pipe->Idle();
+    }
 
     /// Reserve size bytes aligned to 8 bytes on stage A; valid until Commit
     u8* Begin(u32 size);
