@@ -960,6 +960,40 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+
+    static const bool spec_memo = [] {
+        const char* v = std::getenv("PINK_SPEC_MEMO");
+        const bool on = !v || v[0] != '0';
+        LOG_WARNING(Render_Vulkan, "Specialization memo: {}", on ? "on" : "off");
+        return on;
+    }();
+    static thread_local std::vector<u8> memo_key;
+    if (spec_memo) {
+        const auto ud = info.user_data;
+        const auto& flat = info.flattened_ud_buf;
+        const size_t total = sizeof(runtime_info) + sizeof(binding) + ud.size_bytes() +
+                             flat.size() * sizeof(u32);
+        memo_key.resize(total);
+        u8* out = memo_key.data();
+        std::memcpy(out, &runtime_info, sizeof(runtime_info));
+        out += sizeof(runtime_info);
+        std::memcpy(out, &binding, sizeof(binding));
+        out += sizeof(binding);
+        std::memcpy(out, ud.data(), ud.size_bytes());
+        out += ud.size_bytes();
+        std::memcpy(out, flat.data(), flat.size() * sizeof(u32));
+        if (program->memo_perm != ~0u && program->memo_key == memo_key &&
+            program->memo_perm < program->modules.size() &&
+            program->modules[program->memo_perm].module) {
+            const u32 memo_perm = program->memo_perm;
+            info.AddBindings(binding);
+            if (auto& fetch = program->modules[memo_perm].spec.fetch_shader_data; !fetch.Empty()) {
+                fetch_shader = &fetch;
+            }
+            return std::make_tuple(&program->info, program->modules[memo_perm].module,
+                                   HashCombine(params.hash, static_cast<size_t>(memo_perm)));
+        }
+    }
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
@@ -1019,6 +1053,10 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     }
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
+    }
+    if (spec_memo) {
+        program->memo_key = memo_key;
+        program->memo_perm = static_cast<u32>(perm_idx);
     }
     return std::make_tuple(&program->info, module, perm_hash);
 }

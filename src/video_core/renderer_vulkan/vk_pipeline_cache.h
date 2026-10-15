@@ -70,6 +70,11 @@ struct Program {
     /// AllocateShaderBinaryIndex keeps the stored indices stable, so we must keep the same order
     /// without renumbering them
     boost::container::small_vector<u32, MaxPermutations> valid_permuts{};
+    /// PINK_SPEC_MEMO (experimental build): the inputs of the last specialization of this program
+    /// (runtime info, user data, flattened user data, first bindings) and the permutation they
+    /// found. The same bytes give the same specialization, so the lookup is skipped
+    std::vector<u8> memo_key;
+    u32 memo_perm{~0u};
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)

@@ -18,6 +18,7 @@
 #include "common/path_util.h"
 #include "common/signal_context.h"
 #include "core/emulator_settings.h"
+#include "core/memory.h"
 #include "core/signals.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -102,14 +103,27 @@ u64* AllocateCleanPages() {
     return pages;
 }
 
+void SrtCopyWindow(u32* dst, u64 src, u64 bytes) {
+    Core::Memory::Instance()->CopySparseMemory(src, reinterpret_cast<u8*>(dst), bytes);
+}
+
 SrtWalkerContext& WalkerContext() {
     static SrtWalkerContext context{
         .clean_pages = AllocateCleanPages(),
         .clean_load = &NoCleanLoad,
+        .copy_window = &SrtCopyWindow,
     };
     return context;
 }
 } // namespace
+
+bool ReadConstWindows() {
+    static const bool on = [] {
+        const char* v = std::getenv("PINK_DMA_WINDOW");
+        return !EmulatorSettings.IsDirectMemoryAccessEnabled() && (!v || v[0] != '0');
+    }();
+    return on;
+}
 
 const SrtWalkerContext* GetSrtWalkerContext() {
     return &WalkerContext();
@@ -371,6 +385,17 @@ static inline u16 GetFlatbufOffset(const IR::Inst* inst) {
         return inst->Flags<u16>();
     }
     UNREACHABLE_MSG("Instruction not supported");
+}
+
+/// Copies the flattened buffer placement of a ReadConst, with the dynamic window flag
+static inline void CopyFlatbufPlacement(IR::Inst* dst, const IR::Inst* src) {
+    if (src->GetOpcode() == IR::Opcode::ReadConst) {
+        dst->SetFlags(src->Flags<u32>());
+        return;
+    }
+    auto inst_info = dst->Flags<IR::BufferInstInfo>();
+    inst_info.flatbuf_off_dw.Assign(src->Flags<IR::BufferInstInfo>().flatbuf_off_dw);
+    dst->SetFlags(inst_info);
 }
 
 static inline void SetFlatbufOffset(IR::Inst* inst, u16 offset) {
@@ -688,6 +713,10 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
         return true;
     case IR::Opcode::ReadConst:
     case IR::Opcode::ReadConstBuffer:
+        if (inst->GetOpcode() == IR::Opcode::ReadConst &&
+            (pass_info.DeduplicateInstruction(inst)->Flags<u32>() & ReadConstDynamicWindowFlag)) {
+            return false; // the value is only known while the shader runs
+        }
         if (u16 offset = GetFlatbufOffset(pass_info.DeduplicateInstruction(inst)); offset != 0) {
             c.mov(reg, ptr[rsi + (offset << 2)]);
             return true;
@@ -815,6 +844,35 @@ static void EmitCleanLoadStub(Xbyak::CodeGenerator& c, PassInfo& pass_info) {
     c.ret();
 }
 
+/// Calls SrtWalkerContext::copy_window(flat_dst + dst_off_dw, rdi, window bytes) with the walker's
+/// registers saved (rdi = current table, rsi = flattened buffer, r8 = context)
+static void EmitCopyWindow(Xbyak::CodeGenerator& c, u32 dst_off_dw) {
+    c.push(rcx);
+    c.push(rdx);
+    c.push(rsi);
+    c.push(rdi);
+    c.push(r8);
+    c.push(r10);
+    c.push(r11);
+    c.push(rbx);
+    c.mov(rbx, rsp);
+    c.and_(rsp, -16);
+    c.mov(rax, rdi);
+    c.lea(rdi, ptr[rsi + (dst_off_dw << 2)]);
+    c.mov(rsi, rax);
+    c.mov(edx, ReadConstDynamicWindowDwords * sizeof(u32));
+    c.call(ptr[r8 + 16]);
+    c.mov(rsp, rbx);
+    c.pop(rbx);
+    c.pop(r11);
+    c.pop(r10);
+    c.pop(r8);
+    c.pop(rdi);
+    c.pop(rsi);
+    c.pop(rdx);
+    c.pop(rcx);
+}
+
 static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const IR::Value& off_dw) {
     // On failure the partial code (including the push) is rolled back: a push without its pop would make the
     // walker return through a stale rdi
@@ -860,6 +918,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     // flattened buffer.
     // TODO src and dst are contiguous. Optimize with wider loads/stores
     // TODO if this subtree is dynamically indexed, don't compact it (keep it sparse)
+    std::optional<u32> dynamic_window;
     for (auto [src_off_dw, use] : *use_list) {
         if (src_off_dw.IsImmediate()) {
             EmitGuestLoad(c, pass_info, GuestLoadDst::R10d, ptr[rdi + (src_off_dw.U32() << 2)]);
@@ -867,6 +926,17 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
             const size_t code_begin = c.getSize();
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
                 c.setSize(code_begin);
+                if (use->GetOpcode() == IR::Opcode::ReadConst && ReadConstWindows() &&
+                    GetSrtWalkerContext() != nullptr) {
+                    // Index known only while the shader runs: copy a window of the table
+                    if (!dynamic_window) {
+                        dynamic_window = pass_info.dst_off_dw;
+                        EmitCopyWindow(c, pass_info.dst_off_dw);
+                        pass_info.dst_off_dw += ReadConstDynamicWindowDwords;
+                    }
+                    use->SetFlags(*dynamic_window | ReadConstDynamicWindowFlag);
+                    continue;
+                }
                 LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
                 continue;
             }
@@ -1118,7 +1188,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
     for (IR::Inst* readconst : all_readconsts) {
         ASSERT(pass_info.vn_to_inst.contains(pass_info.gvn_table.GetValueNumber(readconst)));
         IR::Inst* original = pass_info.DeduplicateInstruction(readconst);
-        SetFlatbufOffset(readconst, GetFlatbufOffset(original));
+        CopyFlatbufPlacement(readconst, original);
     }
 
     program.info.RefreshFlatBuf();

@@ -37,6 +37,7 @@ constexpr u32 LdsBarriersLargeGroupsBit = 46;
 constexpr u32 RelativeInstanceIdBit = 47;
 constexpr u32 GcnNanSemanticsBit = 48;
 constexpr u32 LegacyMadSemanticsBit = 49;
+constexpr u32 ReadConstWindowsBit = 50;
 
 u64 CodegenSettingsKey() {
     return u64{EmulatorSettings.GetComputeLoopCap()} |
@@ -51,7 +52,8 @@ u64 CodegenSettingsKey() {
            (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit) |
            (u64{EmulatorSettings.IsRelativeInstanceId()} << RelativeInstanceIdBit) |
            (u64{EmulatorSettings.IsGcnNanSemantics()} << GcnNanSemanticsBit) |
-           (u64{EmulatorSettings.IsLegacyMadSemantics()} << LegacyMadSemanticsBit);
+           (u64{EmulatorSettings.IsLegacyMadSemantics()} << LegacyMadSemanticsBit) |
+           (u64{Shader::ReadConstWindows()} << ReadConstWindowsBit);
 }
 
 /// lds_barriers_large_groups only affects compute shaders that use LDS in workgroups larger than

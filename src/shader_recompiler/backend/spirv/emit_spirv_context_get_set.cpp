@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/microinstruction.h"
@@ -59,6 +60,13 @@ Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
 
 Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     const u32 flatbuf_off_dw = inst->Flags<u32>();
+    if (flatbuf_off_dw & ReadConstDynamicWindowFlag) {
+        // Runtime index into a window the SRT walker copied into the flattened buffer
+        const u32 window = flatbuf_off_dw & ~ReadConstDynamicWindowFlag;
+        const Id index =
+            ctx.OpUMin(ctx.U32[1], offset, ctx.ConstU32(ReadConstDynamicWindowDwords - 1));
+        return ctx.EmitFlatbufferLoad(ctx.OpIAdd(ctx.U32[1], ctx.ConstU32(window), index));
+    }
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
         return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
     }

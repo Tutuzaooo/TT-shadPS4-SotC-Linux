@@ -20,6 +20,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -417,6 +418,37 @@ private:
     /// back. A readback that drains the GPU brings their windows along in the same drain, so
     /// requests made at the same time cost one GPU wait instead of one each
     std::mutex pending_rb_mutex;
+
+    /// PINK_RB_ASYNC (experimental build): a readback a guest thread asks for is recorded and
+    /// submitted by the command processor without waiting for the GPU; the guest thread waits for
+    /// the GPU, then the command processor applies the data unless the window changed meanwhile
+    /// (then it is read back the usual way). After the SotC PC port (SOTC_RB_ASYNC)
+    struct AsyncReadback {
+        VAddr device_addr{};
+        u64 size{};
+        bool is_write{};
+        const Buffer* arena{};
+        VAddr window_start{};
+        u64 window_size{};
+        /// srcOffset relative to the arena, dstOffset relative to the download
+        boost::container::small_vector<vk::BufferCopy, 8> copies;
+        Vulkan::StagingBufferRef download{};
+        u64 tick{};
+        bool waiting{};
+        bool dirty{};
+    };
+    void BeginAsyncReadback(AsyncReadback& readback);
+    void FinishAsyncReadback(AsyncReadback& readback);
+    /// A GPU write or a readback changed [addr, addr + size): in-flight readbacks of it are stale
+    void MarkInflightReadbacksDirty(VAddr addr, u64 size) {
+        for (AsyncReadback* readback : inflight_readbacks) {
+            readback->dirty |= addr < readback->window_start + readback->window_size &&
+                               readback->window_start < addr + size;
+        }
+    }
+    std::vector<AsyncReadback*> inflight_readbacks;
+    bool async_readbacks{};
+    u64 async_done{}, async_dirty{}, async_empty{};
     boost::container::small_vector<VAddr, 16> pending_rb;
 
     std::unique_ptr<FaultManager> fault_manager;

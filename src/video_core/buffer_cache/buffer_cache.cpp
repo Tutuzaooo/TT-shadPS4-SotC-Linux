@@ -360,7 +360,133 @@ void BufferCache::ReleaseCpuAuthoritativeRange(VAddr device_addr, u64 size) {
     });
 }
 
+void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
+    Vulkan::DrawPipe::CheckOwner("BufferCache::BeginAsyncReadback");
+    const u32 first_block = readback.device_addr >> block_shift;
+    const u32 last_block = (readback.device_addr + readback.size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    constexpr u64 WindowSize = 512_KB;
+    const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
+    const VAddr window_start =
+        std::max<VAddr>(Common::AlignDown(readback.device_addr, WindowSize), arena->cpu_addr);
+    const VAddr window_end = std::min<VAddr>(
+        std::max<VAddr>(window_start + WindowSize, readback.device_addr + readback.size),
+        arena_end);
+    readback.arena = arena;
+    readback.window_start = window_start;
+    readback.window_size = window_end - window_start;
+    const VAddr arena_base = arena->cpu_addr;
+    u64 total = 0;
+    memory_tracker->ForEachDownloadRange<false>(
+        window_start, readback.window_size, [&](u64 address, u64 size) {
+            gpu_modified_ranges.ForEachInRange(address, size, [&](VAddr start, VAddr end) {
+                for (const auto& [lo, len] : memory->SubtractStackRanges(start, end - start)) {
+                    readback.copies.push_back(vk::BufferCopy{
+                        .srcOffset = lo - arena_base,
+                        .dstOffset = total,
+                        .size = len,
+                    });
+                    total += Common::AlignUp(len, u64{64});
+                }
+            });
+        });
+    if (total == 0) {
+        ++async_empty;
+        memory_tracker->UnmarkRegionAsGpuModified(window_start, readback.window_size, false);
+        if (readback.is_write) {
+            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+        }
+        return;
+    }
+    // Held until FinishAsyncReadback: the pool must not hand it out again before
+    readback.download = staging_pool.Request(total, MemoryType::HostCached, 0, true);
+    boost::container::small_vector<vk::BufferCopy, 8> copies = readback.copies;
+    for (auto& copy : copies) {
+        copy.dstOffset += readback.download.offset;
+    }
+    runtime.CopyBuffer(arena, readback.download.buffer, copies);
+    readback.tick = scheduler.CurrentTick();
+    scheduler.Flush();
+    readback.waiting = true;
+    inflight_readbacks.push_back(&readback);
+}
+
+void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
+    Vulkan::DrawPipe::CheckOwner("BufferCache::FinishAsyncReadback");
+    std::erase(inflight_readbacks, &readback);
+    if (readback.dirty) {
+        ++async_dirty;
+        staging_pool.FreeDeferred(readback.download);
+        DownloadMemory(readback.arena, readback.window_start, readback.window_size);
+    } else {
+        ++async_done;
+        readback.download.buffer->Invalidate(readback.download.offset, readback.download.size);
+        std::optional<BpeHeapGuard> heap_guard;
+        if (const u64 heap = EmulatorSettings.GetBpeHeapGuardAddress(); heap != 0) {
+            heap_guard.emplace(memory, heap);
+            if (!heap_guard->IsValid()) {
+                heap_guard.reset();
+            }
+        }
+        const VAddr arena_base = readback.arena->cpu_addr;
+        for (const auto& copy : readback.copies) {
+            const VAddr copy_addr = arena_base + copy.srcOffset;
+            const u8* src = readback.download.mapped + copy.dstOffset;
+            // A page can become a stack while the GPU drains: subtract the stacks again
+            for (const auto& [lo, len] : memory->SubtractStackRanges(copy_addr, copy.size)) {
+                if (heap_guard) {
+                    if (const u64 kept = heap_guard->Write(lo, src + (lo - copy_addr), len);
+                        kept != 0) {
+                        ReportHeapGuardHit(lo, kept);
+                    }
+                    continue;
+                }
+                memory->TryWriteBacking(std::bit_cast<u8*>(lo), src + (lo - copy_addr), len);
+            }
+        }
+        for (const auto& copy : readback.copies) {
+            SubtractGpuModified(arena_base + copy.srcOffset, copy.size);
+            InvalidateCleanPages(arena_base + copy.srcOffset, copy.size);
+        }
+        memory_tracker->UnmarkRegionAsGpuModified(readback.window_start, readback.window_size,
+                                                  false);
+        staging_pool.FreeDeferred(readback.download);
+    }
+    if (readback.is_write) {
+        memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+    }
+    if (Common::PerfStats::Enabled()) {
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(10)) {
+            last = now;
+            LOG_WARNING(Render, "Async readbacks: {} applied, {} read again (window changed), "
+                                "{} with nothing to read (10 s)",
+                        std::exchange(async_done, 0), std::exchange(async_dirty, 0),
+                        std::exchange(async_empty, 0));
+        }
+    }
+}
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    static const bool async = [] {
+        const char* v = std::getenv("PINK_RB_ASYNC");
+        const bool on = v && v[0] == '1';
+        LOG_WARNING(Render, "Asynchronous readbacks: {}", on ? "on" : "off");
+        return on;
+    }();
+    if (async && !assume_locks) {
+        const Common::PerfStats::ScopedNs wait_timer{Common::PerfStats::Id::GuestReadbackWaitNs};
+        AsyncReadback readback{.device_addr = device_addr, .size = size, .is_write = is_write};
+        liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
+        if (readback.waiting) {
+            // The guest thread waits for the GPU, not the command processor
+            scheduler.WaitSubmitted(readback.tick);
+            scheduler.GetWorkSemaphore()->WaitHostRead(readback.tick);
+            liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
+        }
+        return;
+    }
     const auto enqueued = std::chrono::steady_clock::now();
     const auto flush_request = [this, device_addr, size, is_write, assume_locks, enqueued] {
         const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::Readbacks,
@@ -843,6 +969,9 @@ bool BufferCache::RangeFastOn() const {
 }
 
 void BufferCache::AddGpuModified(VAddr addr, u64 size, bool fast) {
+    if (!inflight_readbacks.empty()) {
+        MarkInflightReadbacksDirty(addr, size);
+    }
     const u64 stack_generation = memory->StackRangesGeneration();
     WrittenEntry* entry = nullptr;
     if (fast && size != 0) {
@@ -1061,6 +1190,9 @@ u32 BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
 }
 
 void BufferCache::SubtractGpuModified(VAddr addr, u64 size) {
+    if (!inflight_readbacks.empty()) {
+        MarkInflightReadbacksDirty(addr, size);
+    }
     {
         const CleanGuard guard{*this};
         gpu_modified_ranges.Subtract(addr, size);

@@ -41,7 +41,18 @@ void CompleteSrtLoad(void* context, const SrtLoad& load, u64 value);
 struct SrtWalkerContext {
     u64* clean_pages;                                                 // offset 0
     bool PS4_SYSV_ABI (*clean_load)(u64 address, u32 size, u64* out); // offset 8
+    void (*copy_window)(u32* dst, u64 src, u64 bytes);                // offset 16
 };
+
+/// ReadConst flag (without direct memory access): a load whose dword index is only known while
+/// the shader runs (a loop counter). The walker copies a window of the table into the flattened
+/// buffer; the low bits hold the window's first dword, and the shader clamps the index to it.
+/// After the SotC fork of AjncSystem (609b4dd2): SotC's depth of field reads its sample offsets
+/// this way, and without it draws black blocks over nearby objects
+constexpr u32 ReadConstDynamicWindowFlag = 1u << 31;
+constexpr u32 ReadConstDynamicWindowDwords = 512;
+/// Whether walkers build those windows: direct memory access off and PINK_DMA_WINDOW not 0
+bool ReadConstWindows();
 constexpr u64 SrtCleanPageLimit = 1ULL << 40;
 const SrtWalkerContext* GetSrtWalkerContext();
 /// Sets the clean-load callback owned by the page manager
