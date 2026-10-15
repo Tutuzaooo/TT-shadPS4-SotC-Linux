@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -121,7 +122,8 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
 static constexpr u64 REPLICATE_SHADER_HASH = 0x50784801;
 
 namespace FillStats {
-std::atomic<u64> done{}, bytes{}, gpu{}, big{}, big_bytes{}, ns{};
+std::atomic<u64> done{}, bytes{}, gpu{}, big{}, big_bytes{}, ns{}, mirrored{}, mirror_bytes{},
+    mirror_ns{};
 std::array<std::atomic<u64>, 8> fallback{};
 // 0 shape, 1 control GPU-written, 2 source GPU-written, 3 foreign GPU bytes on the pages,
 // 4 stack pages, 5 not backed, 6 CPU writes waiting for an upload, 7 over PINK_FILL_HLE_MAX_KB
@@ -143,16 +145,29 @@ void Report() {
     }
     LOG_WARNING(Render_Vulkan,
                 "Fill HLE: {:.0f}/s on the CPU ({:.0f} KB/s, {:.1f} ms/s; over 64 KiB: {:.0f}/s, "
-                "{:.0f} KB/s), {:.0f}/s on the GPU; fallbacks/s: shape {:.0f}, control {:.0f}, "
+                "{:.0f} KB/s), {:.0f}/s on the GPU (copied to memory too: {:.0f}/s, {:.0f} KB/s, "
+                "{:.1f} ms/s); fallbacks/s: shape {:.0f}, control {:.0f}, "
                 "source {:.0f}, pages {:.0f}, stack {:.0f}, backing {:.0f}, upload {:.0f}, "
                 "size cap {:.0f}",
                 done.exchange(0) / seconds, bytes.exchange(0) / 1024.0 / seconds,
                 ns.exchange(0) / 1e6 / seconds, big.exchange(0) / seconds,
                 big_bytes.exchange(0) / 1024.0 / seconds, gpu.exchange(0) / seconds,
+                mirrored.exchange(0) / seconds, mirror_bytes.exchange(0) / 1024.0 / seconds,
+                mirror_ns.exchange(0) / 1e6 / seconds,
                 f[0] / seconds, f[1] / seconds, f[2] / seconds, f[3] / seconds, f[4] / seconds,
                 f[5] / seconds, f[6] / seconds, f[7] / seconds);
 }
 } // namespace FillStats
+
+// A large fill left to the GPU: its values also go to guest memory once the dispatch is
+// recorded, so reads of the table on the CPU need no readback (FinishShaderHLE)
+struct PendingMirror {
+    VAddr address{};
+    u64 count{};
+    const u32* source{};
+    u64 pattern{};
+};
+static PendingMirror pending_mirror{};
 
 static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                                       const AmdGpu::ComputeProgram& cs_program,
@@ -208,11 +223,20 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         const char* v = std::getenv("PINK_FILL_HLE_MAX_KB");
         return (v ? std::strtoull(v, nullptr, 10) : 64) * 1024;
     }();
-    if (max_bytes != 0 && count * 4 > max_bytes) {
-        return fallback(7);
-    }
     if (buffer_cache.IsRegionGpuModified(src.base_address, src_count * 4)) {
         return fallback(2);
+    }
+    if (max_bytes != 0 && count * 4 > max_bytes) {
+        // PINK_FILL_MIRROR=0: the large fills stay on the GPU only
+        static const bool mirror = [] {
+            const char* v = std::getenv("PINK_FILL_MIRROR");
+            return !v || v[0] != '0';
+        }();
+        if (mirror) {
+            pending_mirror = {dst.base_address, count, std::bit_cast<const u32*>(src.base_address),
+                              src_count};
+        }
+        return fallback(7);
     }
     const auto start = std::chrono::steady_clock::now();
     const u32* source = std::bit_cast<const u32*>(src.base_address);
@@ -241,8 +265,26 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     return true;
 }
 
+void FinishShaderHLE(Rasterizer& rasterizer) {
+    if (pending_mirror.count == 0) {
+        return;
+    }
+    const PendingMirror mirror = std::exchange(pending_mirror, {});
+    const auto start = std::chrono::steady_clock::now();
+    if (rasterizer.GetBufferCache().MirrorFillToCpu(mirror.address, mirror.count, mirror.source,
+                                                    mirror.pattern)) {
+        FillStats::mirrored.fetch_add(1, std::memory_order_relaxed);
+        FillStats::mirror_bytes.fetch_add(mirror.count * 4, std::memory_order_relaxed);
+        FillStats::mirror_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - start)
+                                           .count(),
+                                       std::memory_order_relaxed);
+    }
+}
+
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
+    pending_mirror = {};
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);

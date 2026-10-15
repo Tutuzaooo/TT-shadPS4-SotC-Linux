@@ -1791,6 +1791,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     OnGpuCommandRecorded();
     ResetBindings(true);
+    FinishShaderHLE(*this);
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {

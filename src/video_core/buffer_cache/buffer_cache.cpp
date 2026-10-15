@@ -955,6 +955,66 @@ u32 BufferCache::TryFillFromCpu(VAddr addr, u64 count, const u32* src, u64 patte
     return 0;
 }
 
+bool BufferCache::MirrorFillToCpu(VAddr addr, u64 count, const u32* src, u64 pattern) {
+    const u64 size = count * 4;
+    if (size == 0 || pattern == 0 || (addr & 3) != 0) {
+        return false;
+    }
+    constexpr u64 BackingPage = 16_KB;
+    for (VAddr page = Common::AlignDown(addr, BackingPage); page < addr + size;
+         page += BackingPage) {
+        if (!memory->GetBackingPointer(std::max(page, addr))) {
+            return false;
+        }
+    }
+    if (!memory->GetStackRangesIn(addr, size).empty()) {
+        return false;
+    }
+    // The page tracker learns about written bindings when the sync batch is flushed: flush it now,
+    // so it does not mark the range GPU-modified again afterwards
+    if (IsRegionInSyncBatch(addr, size)) {
+        FlushSyncBatch();
+    }
+    // Guest memory: the values the dispatch writes (its source is not GPU-modified, so the
+    // dispatch reads what the CPU reads here)
+    u64 phase = 0;
+    for (VAddr current = addr; current < addr + size;) {
+        const VAddr page_end = std::min(Common::AlignDown(current, BackingPage) + BackingPage,
+                                        addr + size);
+        auto* out = const_cast<u8*>(memory->GetBackingPointer(current));
+        u64 elements = (page_end - current) / 4;
+        while (elements != 0) {
+            const u64 run = std::min(elements, pattern - phase);
+            std::memcpy(out, src + phase, run * 4);
+            out += run * 4;
+            elements -= run;
+            phase += run;
+            if (phase == pattern) {
+                phase = 0;
+            }
+        }
+        current = page_end;
+    }
+    SubtractGpuModified(addr, size);
+    InvalidateCleanPages(addr, size);
+    // Whole pages only, plus the edge pages whose other bytes are not GPU-written either
+    VAddr lo = Common::AlignUp(addr, VAddr{4096});
+    VAddr hi = Common::AlignDown(addr + size, VAddr{4096});
+    const VAddr lo_page = Common::AlignDown(addr, VAddr{4096});
+    if (lo_page < addr && !gpu_modified_ranges.Intersects(lo_page, addr - lo_page)) {
+        lo = lo_page;
+    }
+    const VAddr hi_page = Common::AlignUp(addr + size, VAddr{4096});
+    if (hi_page > addr + size &&
+        !gpu_modified_ranges.Intersects(addr + size, hi_page - (addr + size))) {
+        hi = hi_page;
+    }
+    if (hi > lo) {
+        memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
+    }
+    return true;
+}
+
 u32 BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
     if (size == 0) {
         return 0;

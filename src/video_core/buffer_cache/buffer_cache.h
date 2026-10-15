@@ -148,6 +148,10 @@ public:
     /// neither CPU- nor GPU-modified). Returns 0, or a reason code as TryReplaceFromCpu, or 4: CPU
     /// writes of these pages wait for an upload that GPU commands of this batch would see first
     u32 TryFillFromCpu(VAddr addr, u64 count, const u32* src, u64 pattern);
+    /// Fill HLE, large fills: the dispatch writing them was just recorded. Writes the same values
+    /// to guest memory and takes the range out of the GPU-modified set, so CPU reads need no
+    /// readback. Returns false when nothing was done
+    bool MirrorFillToCpu(VAddr addr, u64 count, const u32* src, u64 pattern);
 
     enum class CleanRead { Served, GpuWritten, Miss };
     /// Clean reads (Rasterizer::ReadCleanMemory) of [addr, addr + size), within one 4 KiB page, from a cache
