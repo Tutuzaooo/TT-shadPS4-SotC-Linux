@@ -805,6 +805,10 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     if (packet_in_pipe && !in_pipe) {
         // Drain earlier packets before this inline packet when SHADPS4_AB_TOGGLE disables draw_pipe
         DrainDrawPipe();
+    } else if (!packet_in_pipe && in_pipe) {
+        // After inline packets, or at startup with stage B idle, flush outstanding writes so constant_ring uses the stream path and early
+        // SRT walks fault on the new marks
+        buffer_cache.FlushSyncBatch();
     }
     packet_in_pipe = in_pipe;
     const Common::PerfStats::ScopedNs pack_timer{Common::PerfStats::Id::PipePackNs};
@@ -973,6 +977,10 @@ void Rasterizer::AddNetRange(VAddr addr, u64 size, u64 packet, bool cpu) {
 
 void Rasterizer::NetPendingWrite(VAddr addr, u64 size) {
     if (!draw_pipe || !net_enabled || !DrawPipe::OnStageA() || size == 0 || !IsMapped(addr, 1)) {
+        return;
+    }
+    // Skip tracking for inline packets because no work is in flight; BuildPacket or BeginTask marks their writes when the pipe resumes
+    if (!UsePipe() && !packet_in_pipe) {
         return;
     }
     PruneNet();
@@ -1147,7 +1155,11 @@ void Rasterizer::VerifyRingBinding(const Shader::Info& stage, const DrawPacket::
 
 u8* Rasterizer::BeginTask(u32 size, void (*run)(const void* task)) {
     using DrawPacket::Align;
-    // Ring tasks order later packets behind them; BuildPacket drains when switching to inline recording
+    // Ring tasks order later packets behind them; after inline recording, mark its writes as BuildPacket does, and drain before switching
+    // back inline
+    if (!packet_in_pipe) {
+        buffer_cache.FlushSyncBatch();
+    }
     packet_in_pipe = true;
     const u32 total = Align(sizeof(DrawPacket::TaskHeader)) + Align(size);
     u8* data = draw_pipe->Begin(total);
