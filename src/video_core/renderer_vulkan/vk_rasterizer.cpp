@@ -4187,7 +4187,17 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     // Draining on guest threads does nothing; they instead wait for published packets that may still upload from the unmapped range
     DrainDrawPipe();
     if (draw_pipe && !DrawPipe::OnStageA() && !DrawPipe::OnStageB()) {
-        draw_pipe->WaitPublished();
+        // Wait only for overlapping GPU mappings; MapMemory and MapFile also call this for free ranges, and the console GPU cannot access
+        // the remaining free or file-mapped memory
+        const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        bool gpu_mapped;
+        {
+            Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+            gpu_mapped = boost::icl::intersects(mapped_ranges, range);
+        }
+        if (gpu_mapped) {
+            draw_pipe->WaitPublished();
+        }
     }
     Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::GpuUnmap, addr, size);
     // Bump the mapping generation before removing the range as well as afterward
