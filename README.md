@@ -194,6 +194,10 @@ The first boot of 0.5.0 recompiles the shaders once because the cache format cha
 version 11), so expect stuttering until the cache is rebuilt. The old cache does not need to be deleted for
 this.
 
+Since 0.5.0, other games may show more `BROKEN SHADER` events in the console. These shaders already drew
+with a missing resource, so the image does not change, and the events are no reason to enable
+`direct_memory_access_enabled`.
+
 If a game shows a burst of rejected textures, thousands of new shader permutations or a device loss right
 after boot, the shader cache may have been corrupted by an older build (a new permutation could overwrite
 another one on disk). Delete the whole `user/cache/<serial>` folder (or `<serial>.zip`) and let it rebuild.
