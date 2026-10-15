@@ -806,29 +806,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         if (On()) {
             stream_copies.fetch_add(1, std::memory_order_relaxed);
             stream_bytes.fetch_add(size, std::memory_order_relaxed);
-            // One range in 8 (by address and size): does the copy hold what the previous copy of
-            // the same range held? Then the previous copy could have been bound again
-            const u64 key = device_addr ^ (u64{size} << 44);
-            const u64 hash = (key * 0x9E3779B97F4A7C15ULL) >> 52;
-            if ((hash & 7) == 0) {
-                struct Shadow {
-                    u64 key = ~0ULL;
-                    std::vector<u8> data;
-                };
-                static std::array<Shadow, 4096> shadows;
-                static std::vector<u8> current;
-                auto& shadow = shadows[hash];
-                current.resize(size);
-                memory->CopySparseMemory(device_addr, current.data(), size);
-                if (shadow.key == key) {
-                    stream_sampled.fetch_add(1, std::memory_order_relaxed);
-                    if (shadow.data == current) {
-                        stream_same.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-                shadow.key = key;
-                shadow.data.swap(current);
-            }
         }
         return {&stream_buffer, mapped.second};
     }

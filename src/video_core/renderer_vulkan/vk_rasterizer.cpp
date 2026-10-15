@@ -1260,14 +1260,18 @@ void Rasterizer::PrintPipeStats() {
             parts += fmt::format("{}{} {:.2f}", i ? ", " : "", Names[i], us);
         }
         const u64 copies = stream_copies.exchange(0);
-        const u64 sampled = stream_sampled.exchange(0);
+        std::string paths;
+        for (u32 i = 0; i < NumPaths; ++i) {
+            const u64 n = path_count[i].exchange(0);
+            const double us = static_cast<double>(path_cycles[i].exchange(0)) * us_per_cycle;
+            paths += fmt::format("{}{} {:.2f}/draw {:.2f} us each", i ? ", " : "", PathNames[i],
+                                 static_cast<double>(n) / recorded, n ? us / n : 0.0);
+        }
         LOG_WARNING(Render_Vulkan,
                     "DrawRec per draw (us): {}; {:.0f} draws/s; stream copies {:.0f}/s, "
-                    "{:.0f} MB/s, {:.1f} per draw, same content as the previous copy {:.0f}%",
+                    "{:.0f} MB/s; buffer bindings: {}",
                     parts, recorded / seconds, copies / seconds,
-                    stream_bytes.exchange(0) / 1048576.0 / seconds,
-                    static_cast<double>(copies) / recorded,
-                    sampled ? 100.0 * stream_same.exchange(0) / sampled : 0.0);
+                    stream_bytes.exchange(0) / 1048576.0 / seconds, paths);
     }
     std::string line = fmt::format(
         "Draw pipe: mode {}, {:.0f} packets/s (draws {}, indirect {}, dispatches {}, indirect {}, "
@@ -2454,7 +2458,10 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
+    const bool prof_on = DrawRecProf::On();
     for (const auto& desc : stage.buffers) {
+        const u64 prof_start = prof_on ? __rdtsc() : 0;
+        u32 path = DrawRecProf::PathSpecial;
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
@@ -2551,6 +2558,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bind_cache ? &bind_cache->Buffer(bind_cache_buffer_index++) : nullptr;
             const bool reuse = slot && !desc.is_written && slot->Matches(vsharp, bind_generations);
             if (reuse && !incremental_bind_verify) {
+                path = DrawRecProf::PathReused;
                 buffer_cache.ReuseReadBuffer(slot->arena, vsharp.base_address, slot->size,
                                              desc.is_formatted);
                 Common::PerfStats::Add(Common::PerfStats::Id::BindReusedBuffers);
@@ -2574,6 +2582,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // guest has not mapped
                 if (vsharp.base_address <= 1 || vsharp.GetSize() == 0 ||
                     !IsMapped(vsharp.base_address, 1)) {
+                    path = DrawRecProf::PathNull;
                     buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
                 } else {
                     u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
@@ -2616,6 +2625,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                         vsharp.base_address, size, desc.is_written, desc.is_formatted);
                     const bool stream = buffer == &buffer_cache.GetStreamBuffer();
+                    path = desc.is_written ? DrawRecProf::PathWritten
+                           : stream        ? DrawRecProf::PathStream
+                                           : DrawRecProf::PathArena;
                     if (slot && !desc.is_written && !stream) {
                         *slot = {
                             .sharp = vsharp,
@@ -2648,6 +2660,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
+        if (prof_on) {
+            DrawRecProf::path_count[path].fetch_add(1, std::memory_order_relaxed);
+            DrawRecProf::path_cycles[path].fetch_add(__rdtsc() - prof_start,
+                                                     std::memory_order_relaxed);
+        }
     }
 }
 
