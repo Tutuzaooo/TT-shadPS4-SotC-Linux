@@ -536,6 +536,9 @@ private:
     u32 packet_capacity{};
     u8* packet_data{};
     bool packet_in_pipe{};
+    /// Without draw_pipe or verification, omit packet register and user-data copies; stage B reads live state immediately after stage A on
+    /// the same thread
+    bool packet_live{};
     std::unique_ptr<AmdGpu::Regs> pipe_regs;
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> pipe_cb_extent{};
     AmdGpu::CbDbExtent pipe_db_extent{};

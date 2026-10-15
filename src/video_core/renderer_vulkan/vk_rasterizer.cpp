@@ -669,6 +669,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             LOG_WARNING(Render_Vulkan, "draw_pipe: readback_ahead {}", off);
         }
     }
+    // Keep captured state when verification needs to compare it with live state
+    packet_live = !draw_pipe && pipe_verify_interval == 0;
     if (pipe_steps != 0) {
         LOG_WARNING(Render_Vulkan, "Workaround draw_pipe_steps enabled: {:#x}{}{}", pipe_steps,
                     !draw_pipe     ? " (ignored without draw_pipe)"
@@ -825,13 +827,16 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     // Decide here whether verification needs the full register file on stage B
     const bool verify =
         pipe_verify_interval != 0 && ++pipe_verify_packets % pipe_verify_interval == 0;
-    const u32 num_blocks = dirty.NumDirty();
+    // Without a draw pipe, stage B runs next on this thread before live state changes, so it reads live registers and user data instead of
+    // packet copies
+    const bool live = packet_live;
+    const u32 num_blocks = live ? 0 : dirty.NumDirty();
     const bool has_cs =
         kind == DrawPacket::Kind::Dispatch || kind == DrawPacket::Kind::DispatchIndirect;
     u32 size = Align(sizeof(DrawPacket::Header)) + Align(num_blocks * sizeof(u16)) +
                num_blocks * BlockBytes;
     u32 num_stages = 0;
-    if (pipeline) {
+    if (pipeline && !live) {
         for (const auto* stage : pipeline->GetStages()) {
             if (stage) {
                 ASSERT(num_stages < Shader::Info::MaxUdSnapshots);
@@ -847,7 +852,7 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
             }
         }
     }
-    if (has_cs) {
+    if (has_cs && !live) {
         size += Align(sizeof(AmdGpu::ComputeProgram));
     }
     if (verify) {
@@ -869,7 +874,7 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     packet.size = size;
     packet.kind = kind;
     packet.compute = compute;
-    packet.regs_reset = dirty.Reset();
+    packet.regs_reset = !live && dirty.Reset();
     packet.num_stages = static_cast<u8>(num_stages);
     packet.num_blocks = static_cast<u16>(num_blocks);
     packet.unordered_ring = -1;
@@ -878,8 +883,10 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     packet.verify = verify;
     packet.game_sync_rings = std::exchange(pending_game_sync, u16{0});
     packet.pipeline = pipeline;
-    packet.cb_extent = liverpool->last_cb_extent;
-    packet.db_extent = liverpool->last_db_extent;
+    if (!live) {
+        packet.cb_extent = liverpool->last_cb_extent;
+        packet.db_extent = liverpool->last_db_extent;
+    }
     packet.ring_end = constant_ring ? constant_ring->Position() : 0;
     u8* out = data + Align(sizeof(DrawPacket::Header));
     const u16* blocks = dirty.Blocks();
@@ -891,7 +898,7 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
         out += BlockBytes;
     }
     dirty.Clear();
-    if (pipeline) {
+    if (pipeline && !live) {
         u32 stage_index = 0;
         for (const auto* stage : pipeline->GetStages()) {
             if (!stage) {
@@ -919,7 +926,7 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
             }
         }
     }
-    if (has_cs) {
+    if (has_cs && !live) {
         std::memcpy(out, &liverpool->GetCsRegs(), sizeof(AmdGpu::ComputeProgram));
         out += Align(sizeof(AmdGpu::ComputeProgram));
     }
@@ -1222,8 +1229,8 @@ void Rasterizer::RunPacket(const u8* data) {
     }
     Shader::Info::num_ud_snapshots = packet.num_stages;
     const AmdGpu::ComputeProgram* cs = nullptr;
-    if (packet.kind == DrawPacket::Kind::Dispatch ||
-        packet.kind == DrawPacket::Kind::DispatchIndirect) {
+    if (!packet_live && (packet.kind == DrawPacket::Kind::Dispatch ||
+                         packet.kind == DrawPacket::Kind::DispatchIndirect)) {
         cs = reinterpret_cast<const AmdGpu::ComputeProgram*>(in);
         in += Align(sizeof(AmdGpu::ComputeProgram));
     }
@@ -1233,10 +1240,12 @@ void Rasterizer::RunPacket(const u8* data) {
         in += Align(sizeof(AmdGpu::Regs));
     }
     ASSERT(static_cast<u32>(in - data) == packet.size);
-    stage_regs = pipe_regs.get();
-    stage_cs = cs;
-    pipe_cb_extent = packet.cb_extent;
-    pipe_db_extent = packet.db_extent;
+    if (!packet_live) {
+        stage_regs = pipe_regs.get();
+        stage_cs = cs;
+        pipe_cb_extent = packet.cb_extent;
+        pipe_db_extent = packet.db_extent;
+    }
     if (verify_regs) {
         VerifyPacket(packet, *verify_regs);
     }
