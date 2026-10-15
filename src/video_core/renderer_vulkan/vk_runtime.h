@@ -41,6 +41,8 @@ public:
     void FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value);
 
     void InlineData(VideoCore::Buffer* dst, u64 offset, u32 value);
+    /// vkCmdUpdateBuffer in command order (size a multiple of 4, at most 64 KiB)
+    void UpdateBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, const void* data);
 
     bool Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,

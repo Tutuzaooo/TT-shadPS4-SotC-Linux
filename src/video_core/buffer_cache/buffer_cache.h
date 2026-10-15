@@ -142,8 +142,11 @@ public:
     /// Returns a reason code: 0 written, 1 GPU-written bytes elsewhere on its pages,
     /// 2 stack pages, 3 not backed. Draw recording thread (or command processor) only
     u32 TryReplaceFromCpu(VAddr addr, const void* data, u64 size);
-    /// Same, for the fill HLE: writes dst[i] = src[i % pattern] for i < count (32-bit elements)
-    /// straight into the backing, page by page, without a staging copy
+    /// Fill HLE: dst[i] = src[i % pattern] for i < count (32-bit elements), written to guest
+    /// memory now and to the GPU copy at this point of the command buffer, so GPU commands
+    /// recorded before still read the old values. Afterwards both copies agree (the range is
+    /// neither CPU- nor GPU-modified). Returns 0, or a reason code as TryReplaceFromCpu, or 4: CPU
+    /// writes of these pages wait for an upload that GPU commands of this batch would see first
     u32 TryFillFromCpu(VAddr addr, u64 count, const u32* src, u64 pattern);
 
     enum class CleanRead { Served, GpuWritten, Miss };

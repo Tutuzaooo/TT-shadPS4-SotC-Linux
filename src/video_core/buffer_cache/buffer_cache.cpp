@@ -880,10 +880,8 @@ u32 BufferCache::TryFillFromCpu(VAddr addr, u64 count, const u32* src, u64 patte
     const VAddr lo = Common::AlignDown(addr, VAddr{4096});
     const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
     bool foreign = false;
-    bool inside = false;
     gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
         foreign |= start < addr || end > addr + size;
-        inside = true;
     });
     if (foreign) {
         return 1;
@@ -891,33 +889,69 @@ u32 BufferCache::TryFillFromCpu(VAddr addr, u64 count, const u32* src, u64 patte
     if (!memory->GetStackRangesIn(lo, hi - lo).empty()) {
         return 2;
     }
-    if (inside) {
-        // GPU writes of these bytes may still be in the command buffer being recorded: submit it,
-        // so the upload of the CPU data below cannot run before them
-        scheduler.Flush();
+    // A pending upload of these pages runs before the whole batch: it would show the new values
+    // to the GPU commands recorded before this point
+    if (IsRegionInSyncBatch(lo, hi - lo) && memory_tracker->IsRegionCpuModified(lo, hi - lo)) {
+        return 4;
     }
-    memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
-    SubtractGpuModified(addr, size);
-    InvalidateCleanPages(addr, size);
-    u64 phase = 0; // element % pattern
+    const u64 first_block = addr >> block_shift;
+    const u64 last_block = (addr + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    if (!IsResident(first_block, last_block)) {
+        EnsureResident(arena, first_block, last_block);
+    }
+    if (arena_use) {
+        TouchArenaUse(addr, size);
+    }
+
+    // The values: in a staging buffer for the GPU copy (large fills) or a scratch vector
+    // (vkCmdUpdateBuffer, at most 64 KiB)
+    constexpr u64 MaxUpdate = 64_KB;
+    static std::vector<u32> scratch;
+    std::optional<Vulkan::StagingBufferRef> staging;
+    u32* values;
+    if (size <= MaxUpdate) {
+        scratch.resize(count);
+        values = scratch.data();
+    } else {
+        staging = staging_pool.Request(size, MemoryType::HostUncached);
+        values = reinterpret_cast<u32*>(staging->mapped);
+    }
+    std::memcpy(values, src, std::min(pattern, count) * 4);
+    for (u64 filled = std::min(pattern, count); filled < count;) {
+        const u64 chunk = std::min(filled, count - filled);
+        std::memcpy(values + filled, values, chunk * 4);
+        filled += chunk;
+    }
+
+    // GPU copy, in command order
+    const u64 offset = arena->Offset(addr);
+    if (staging) {
+        staging->Flush();
+        const vk::BufferCopy copy = {
+            .srcOffset = staging->offset,
+            .dstOffset = offset,
+            .size = size,
+        };
+        runtime.CopyBuffer(staging->buffer, arena, std::span{&copy, 1});
+    } else {
+        runtime.UpdateBuffer(arena, offset, size, values);
+    }
+
+    // Guest memory, page by page through the backing
+    const auto* in = reinterpret_cast<const u8*>(values);
     for (VAddr current = addr; current < addr + size;) {
         const VAddr page_end = std::min(Common::AlignDown(current, BackingPage) + BackingPage,
                                         addr + size);
         auto* out = const_cast<u8*>(memory->GetBackingPointer(current));
-        u64 elements = (page_end - current) / 4;
-        while (elements != 0) {
-            const u64 run = std::min(elements, pattern - phase);
-            std::memcpy(out, src + phase, run * 4);
-            out += run * 4;
-            elements -= run;
-            phase += run;
-            if (phase == pattern) {
-                phase = 0;
-            }
-        }
+        std::memcpy(out, in, page_end - current);
+        in += page_end - current;
         current = page_end;
     }
-    memory_tracker->MarkRegionAsCpuModified(addr, size);
+    // Both copies hold the values now (the GPU one once the copy above runs)
+    memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
+    SubtractGpuModified(addr, size);
+    InvalidateCleanPages(addr, size);
     return 0;
 }
 

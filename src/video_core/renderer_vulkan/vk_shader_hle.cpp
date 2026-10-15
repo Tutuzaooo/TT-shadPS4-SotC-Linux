@@ -124,7 +124,7 @@ namespace FillStats {
 std::atomic<u64> done{}, bytes{}, gpu{}, big{}, big_bytes{}, ns{};
 std::array<std::atomic<u64>, 8> fallback{};
 // 0 shape, 1 control GPU-written, 2 source GPU-written, 3 foreign GPU bytes on the pages,
-// 4 stack pages, 5 not backed, 6 over PINK_FILL_HLE_MAX_KB
+// 4 stack pages, 5 not backed, 6 CPU writes waiting for an upload, 7 over PINK_FILL_HLE_MAX_KB
 void Report() {
     static auto last = std::chrono::steady_clock::now();
     static u32 calls = 0;
@@ -144,12 +144,13 @@ void Report() {
     LOG_WARNING(Render_Vulkan,
                 "Fill HLE: {:.0f}/s on the CPU ({:.0f} KB/s, {:.1f} ms/s; over 64 KiB: {:.0f}/s, "
                 "{:.0f} KB/s), {:.0f}/s on the GPU; fallbacks/s: shape {:.0f}, control {:.0f}, "
-                "source {:.0f}, pages {:.0f}, stack {:.0f}, backing {:.0f}, size cap {:.0f}",
+                "source {:.0f}, pages {:.0f}, stack {:.0f}, backing {:.0f}, upload {:.0f}, "
+                "size cap {:.0f}",
                 done.exchange(0) / seconds, bytes.exchange(0) / 1024.0 / seconds,
                 ns.exchange(0) / 1e6 / seconds, big.exchange(0) / seconds,
                 big_bytes.exchange(0) / 1024.0 / seconds, gpu.exchange(0) / seconds,
                 f[0] / seconds, f[1] / seconds, f[2] / seconds, f[3] / seconds, f[4] / seconds,
-                f[5] / seconds, f[6] / seconds);
+                f[5] / seconds, f[6] / seconds, f[7] / seconds);
 }
 } // namespace FillStats
 
@@ -202,13 +203,13 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     if (src_count * 4 > src.GetSize()) {
         return fallback(0);
     }
-    // PINK_FILL_HLE_MAX_KB=<n>: larger fills stay on the GPU (0, the default: no limit)
+    // PINK_FILL_HLE_MAX_KB=<n>: larger fills stay on the GPU (default 64; 0: no limit)
     static const u64 max_bytes = [] {
         const char* v = std::getenv("PINK_FILL_HLE_MAX_KB");
-        return v ? std::strtoull(v, nullptr, 10) * 1024 : 0;
+        return (v ? std::strtoull(v, nullptr, 10) : 64) * 1024;
     }();
     if (max_bytes != 0 && count * 4 > max_bytes) {
-        return fallback(6);
+        return fallback(7);
     }
     if (buffer_cache.IsRegionGpuModified(src.base_address, src_count * 4)) {
         return fallback(2);
