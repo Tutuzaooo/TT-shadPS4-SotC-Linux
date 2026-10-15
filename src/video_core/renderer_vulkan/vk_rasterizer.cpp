@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_drawrec_prof.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -1249,6 +1250,25 @@ void Rasterizer::PrintPipeStats() {
     }
     const u64 tsc = __rdtsc();
     const double cycles = static_cast<double>(tsc - pipe_stats_tsc);
+    if (const u64 recorded = DrawRecProf::draws.exchange(0); recorded != 0) {
+        using namespace DrawRecProf;
+        const double us_per_cycle = seconds * 1e6 / cycles;
+        std::string parts;
+        for (u32 i = 0; i < Count; ++i) {
+            const double us =
+                static_cast<double>(DrawRecProf::cycles[i].exchange(0)) * us_per_cycle / recorded;
+            parts += fmt::format("{}{} {:.2f}", i ? ", " : "", Names[i], us);
+        }
+        const u64 copies = stream_copies.exchange(0);
+        const u64 sampled = stream_sampled.exchange(0);
+        LOG_WARNING(Render_Vulkan,
+                    "DrawRec per draw (us): {}; {:.0f} draws/s; stream copies {:.0f}/s, "
+                    "{:.0f} MB/s, {:.1f} per draw, same content as the previous copy {:.0f}%",
+                    parts, recorded / seconds, copies / seconds,
+                    stream_bytes.exchange(0) / 1048576.0 / seconds,
+                    static_cast<double>(copies) / recorded,
+                    sampled ? 100.0 * stream_same.exchange(0) / sampled : 0.0);
+    }
     std::string line = fmt::format(
         "Draw pipe: mode {}, {:.0f} packets/s (draws {}, indirect {}, dispatches {}, indirect {}, "
         "special {}, fences {})",
@@ -1499,25 +1519,37 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
                       buffer_cache, page_manager);
     }
 
+    using namespace DrawRecProf;
+    const Scope total{DrawRecProf::Total};
+    Scope prof{DrawRecProf::Prep};
+    if (On()) {
+        draws.fetch_add(1, std::memory_order_relaxed);
+    }
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
+    prof.Next(DrawRecProf::Begin);
     const auto state = BeginRendering(pipeline);
 
+    prof.Next(DrawRecProf::VertexIndex);
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
     }
 
+    prof.Next(DrawRecProf::Barriers);
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
 
     RefreshImageDescriptorLayouts();
+    prof.Next(DrawRecProf::Push);
     pipeline->BindResources(set_writes, push_data);
+    prof.Next(DrawRecProf::State);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
+    prof.Next(DrawRecProf::Draw);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -1548,6 +1580,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     DebugState.IncDrawCall();
 
     OnGpuCommandRecorded();
+    prof.Next(DrawRecProf::Reset);
     ResetBindings(false);
 }
 
@@ -1623,25 +1656,37 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                       "", memory, buffer_cache, page_manager);
     }
 
+    using namespace DrawRecProf;
+    const Scope total{DrawRecProf::Total};
+    Scope prof{DrawRecProf::Prep};
+    if (On()) {
+        draws.fetch_add(1, std::memory_order_relaxed);
+    }
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
+    prof.Next(DrawRecProf::Begin);
     const auto state = BeginRendering(pipeline);
 
+    prof.Next(DrawRecProf::VertexIndex);
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer();
     }
 
     if (direct_args) {
+        prof.Next(DrawRecProf::Barriers);
         if (needs_barrier) {
             runtime.FlushBarriers();
         }
         RefreshImageDescriptorLayouts();
+        prof.Next(DrawRecProf::Push);
         pipeline->BindResources(set_writes, push_data);
+        prof.Next(DrawRecProf::State);
         UpdateDynamicState(pipeline, is_indexed);
         scheduler.BeginRendering(state);
+        prof.Next(DrawRecProf::Draw);
         const auto cmdbuf = scheduler.CommandBuffer();
         scheduler.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
         CountPipelineBind(cmdbuf, vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -1653,9 +1698,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         }
         DebugState.IncDrawCall();
         OnGpuCommandRecorded();
+        prof.Next(DrawRecProf::Reset);
         ResetBindings(false);
         return;
     }
+    prof.Next(DrawRecProf::Barriers);
 
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(arg_address + offset, stride * max_count, false);
@@ -1717,6 +1764,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
 
     OnGpuCommandRecorded();
+    prof.Next(DrawRecProf::Reset);
     ResetBindings(false);
 }
 
@@ -2028,8 +2076,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
         stage->PushUd(binding, push_data);
-        BindBuffers(*stage, binding, push_data);
-        BindTextures(*stage, binding);
+        {
+            const DrawRecProf::Scope prof{DrawRecProf::Buffers};
+            BindBuffers(*stage, binding, push_data);
+        }
+        {
+            const DrawRecProf::Scope prof{DrawRecProf::Textures};
+            BindTextures(*stage, binding);
+        }
         uses_dma |= stage->uses_dma;
     }
 

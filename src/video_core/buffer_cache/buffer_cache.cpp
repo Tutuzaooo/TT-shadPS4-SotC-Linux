@@ -20,6 +20,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
+#include "video_core/renderer_vulkan/vk_drawrec_prof.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/bpe_heap_guard.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -794,10 +795,42 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     Vulkan::DrawPipe::CheckOwner("BufferCache::ObtainBuffer");
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
-        const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
-        memory->CopySparseMemory(device_addr, data, size);
-        stream_buffer.Commit();
-        return {&stream_buffer, offset};
+        using namespace Vulkan::DrawRecProf;
+        std::pair<u8*, u64> mapped;
+        {
+            const Scope prof{StreamCopy};
+            mapped = stream_buffer.Map(size, instance.UniformMinAlignment());
+            memory->CopySparseMemory(device_addr, mapped.first, size);
+            stream_buffer.Commit();
+        }
+        if (On()) {
+            stream_copies.fetch_add(1, std::memory_order_relaxed);
+            stream_bytes.fetch_add(size, std::memory_order_relaxed);
+            // One range in 8 (by address and size): does the copy hold what the previous copy of
+            // the same range held? Then the previous copy could have been bound again
+            const u64 key = device_addr ^ (u64{size} << 44);
+            const u64 hash = (key * 0x9E3779B97F4A7C15ULL) >> 52;
+            if ((hash & 7) == 0) {
+                struct Shadow {
+                    u64 key = ~0ULL;
+                    std::vector<u8> data;
+                };
+                static std::array<Shadow, 4096> shadows;
+                static std::vector<u8> current;
+                auto& shadow = shadows[hash];
+                current.resize(size);
+                memory->CopySparseMemory(device_addr, current.data(), size);
+                if (shadow.key == key) {
+                    stream_sampled.fetch_add(1, std::memory_order_relaxed);
+                    if (shadow.data == current) {
+                        stream_same.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                shadow.key = key;
+                shadow.data.swap(current);
+            }
+        }
+        return {&stream_buffer, mapped.second};
     }
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
@@ -2054,6 +2087,7 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
 }
 
 void BufferCache::FlushSyncBatch(bool from_scheduler) {
+    const Vulkan::DrawRecProf::Scope sync_prof{Vulkan::DrawRecProf::SyncFlush};
     if (range_fast && Common::PerfStats::Enabled()) {
         using Common::PerfStats::Id;
         Common::PerfStats::Add(Id::RangeFastWrittenHits, std::exchange(range_fast_written_hits, 0));
