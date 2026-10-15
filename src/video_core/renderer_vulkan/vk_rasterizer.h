@@ -324,6 +324,47 @@ private:
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
 
+    /// PINK_VERTEX_MEMO (experimental build, default on): the last vertex buffer bindings of each
+    /// pipeline and the last index buffer binding, reused while the guest buffers, the sync batch,
+    /// the GPU mappings and the arenas are unchanged (as incremental_bind does for V#s)
+    bool vertex_memo{};
+    struct VertexMemo {
+        const void* pipeline{};
+        u64 sync_flushes{~0ULL};
+        u64 maps{};
+        u64 arenas{};
+        VertexInputs<AmdGpu::Buffer> guest;
+        VertexInputs<vk::Buffer> host_buffers;
+        VertexInputs<vk::DeviceSize> host_offsets;
+        VertexInputs<vk::DeviceSize> host_sizes;
+        VertexInputs<vk::DeviceSize> host_strides;
+        struct Range {
+            const VideoCore::Buffer* buffer;
+            u64 offset;
+            u64 size;
+        };
+        VertexInputs<Range> ranges;
+    };
+    std::array<VertexMemo, 256> vertex_memo_table{};
+    struct IndexMemo {
+        VAddr address{};
+        u32 size{};
+        u64 sync_flushes{~0ULL};
+        u64 maps{};
+        u64 arenas{};
+        const VideoCore::Buffer* buffer{};
+        u64 offset{};
+    } index_memo{};
+    u64 vertex_memo_hits{}, vertex_memo_misses{}, index_memo_hits{}, index_memo_misses{};
+    /// Written bindings with no image at their address, while no image was registered or removed
+    /// since (experimental build): the texture cache lookup is skipped
+    struct NoImageMemo {
+        VAddr address{};
+        u64 size{};
+        u64 image_sets{~0ULL};
+    };
+    std::array<NoImageMemo, 1024> no_image_memo{};
+
     void ResetBindings(bool is_compute);
     /// Count reused V# and T# slots checked against a full binding and log any mismatch so the
     /// cache assumptions can be verified
@@ -419,9 +460,13 @@ private:
     /// PINK_STREAM_REUSE (default on): small read-only buffers and flattened user data whose bytes
     /// match their last copy into the stream buffer in the same command buffer bind that copy again
     bool stream_reuse{};
+    /// PINK_STREAM_REUSE_TICKS (experimental build, default on): reuse across command buffers
+    /// while fewer than this many bytes went into the stream buffer since the copy (0: off)
+    u64 stream_reuse_distance{};
     struct FlatMemo {
         const void* stage{};
         u64 tick{~0ULL};
+        u64 pos{~0ULL};
         u64 offset{};
         std::vector<u32> data;
     };

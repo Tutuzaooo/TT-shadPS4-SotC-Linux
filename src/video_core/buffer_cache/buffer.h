@@ -142,6 +142,15 @@ struct StreamBuffer : public Buffer {
     /// Reserves and commits a region in one step.
     std::optional<u64> Reserve(u64 size, u64 alignment = 0, bool allow_wait = true);
 
+    /// Position of `at` (an offset of the current lap) counted from the first byte ever written:
+    /// how many bytes were written after a copy tells whether the ring may have reached it again
+    [[nodiscard]] u64 AbsolutePosition(u64 at) const noexcept {
+        return laps * size_bytes + at;
+    }
+    [[nodiscard]] u64 Head() const noexcept {
+        return laps * size_bytes + offset;
+    }
+
     /// Tick of the most recent commit into this buffer, 0 if never used.
     [[nodiscard]] u64 LastTick() const noexcept {
         return last_tick;
@@ -179,6 +188,7 @@ private:
     Vulkan::Scheduler& scheduler;
     vk::DeviceSize non_coherent_atom_size{};
     u64 offset{};
+    u64 laps{};
     u64 mapped_size{};
     u64 last_tick{};
     std::vector<Watch> current_watches;

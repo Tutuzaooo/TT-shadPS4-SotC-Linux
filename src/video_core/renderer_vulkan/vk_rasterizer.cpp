@@ -693,7 +693,17 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             const char* v = std::getenv("PINK_STREAM_REUSE");
             return !v || v[0] != '0';
         }();
-        LOG_WARNING(Render_Vulkan, "Stream copy reuse: {}", stream_reuse ? "on" : "off");
+        stream_reuse_distance = [] {
+            const char* v = std::getenv("PINK_STREAM_REUSE_TICKS");
+            return (v ? std::strtoull(v, nullptr, 10) : 16) << 20;
+        }();
+        LOG_WARNING(Render_Vulkan, "Stream copy reuse: {}, across command buffers: {} MiB",
+                    stream_reuse ? "on" : "off", stream_reuse_distance >> 20);
+        vertex_memo = [] {
+            const char* v = std::getenv("PINK_VERTEX_MEMO");
+            return !v || v[0] != '0';
+        }();
+        LOG_WARNING(Render_Vulkan, "Vertex and index binding memo: {}", vertex_memo ? "on" : "off");
         if (track_pending_writes) {
             pending_granules =
                 std::make_unique<u32[]>(u64{1} << (40 - PendingGranuleBits));
@@ -1255,6 +1265,15 @@ void Rasterizer::PrintPipeStats() {
     }
     const u64 tsc = __rdtsc();
     const double cycles = static_cast<double>(tsc - pipe_stats_tsc);
+    if (vertex_memo) {
+        const u64 vh = std::exchange(vertex_memo_hits, 0), vm = std::exchange(vertex_memo_misses, 0);
+        const u64 ih = std::exchange(index_memo_hits, 0), im = std::exchange(index_memo_misses, 0);
+        LOG_WARNING(Render_Vulkan,
+                    "Binding memo: vertex buffers {:.0f}% of {:.0f}/s, index buffers {:.0f}% of "
+                    "{:.0f}/s",
+                    vh + vm ? 100.0 * vh / (vh + vm) : 0.0, (vh + vm) / seconds,
+                    ih + im ? 100.0 * ih / (ih + im) : 0.0, (ih + im) / seconds);
+    }
     if (const u64 recorded = DrawRecProf::draws.exchange(0); recorded != 0) {
         using namespace DrawRecProf;
         const double us_per_cycle = seconds * 1e6 / cycles;
@@ -2124,6 +2143,34 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         return;
     }
 
+    const u64 gen_sync = buffer_cache.SyncBatchGeneration();
+    const u64 gen_maps = buffer_cache.MappingGeneration();
+    const u64 gen_arenas = buffer_cache.ArenaGeneration();
+    auto& memo =
+        vertex_memo_table[(reinterpret_cast<uintptr_t>(pipeline) >> 6) % vertex_memo_table.size()];
+    if (vertex_memo && memo.pipeline == pipeline && memo.sync_flushes == gen_sync &&
+        memo.maps == gen_maps && memo.arenas == gen_arenas &&
+        memo.guest.size() == guest_buffers.size() &&
+        std::memcmp(memo.guest.data(), guest_buffers.data(),
+                    guest_buffers.size() * sizeof(AmdGpu::Buffer)) == 0) {
+        ++vertex_memo_hits;
+        for (const auto& range : memo.ranges) {
+            needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, range.size);
+        }
+        const auto cmdbuf = scheduler.CommandBuffer();
+        const auto num_buffers = static_cast<u32>(memo.host_buffers.size());
+        if (instance.IsVertexInputDynamicState()) {
+            cmdbuf.bindVertexBuffers(0, num_buffers, memo.host_buffers.data(),
+                                     memo.host_offsets.data());
+        } else {
+            cmdbuf.bindVertexBuffers2(0, num_buffers, memo.host_buffers.data(),
+                                      memo.host_offsets.data(), memo.host_sizes.data(),
+                                      memo.host_strides.data());
+        }
+        return;
+    }
+    ++vertex_memo_misses;
+
     struct BufferRange {
         VAddr base_address;
         VAddr end_address;
@@ -2200,6 +2247,30 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
                                   host_sizes.data(), host_strides.data());
     }
+
+    // Stream buffer copies hold the bytes of this draw only: those bindings are not remembered
+    bool remember = vertex_memo;
+    for (const auto& range : ranges_merged) {
+        remember &= range.buffer != &buffer_cache.GetStreamBuffer();
+    }
+    if (remember) {
+        memo.pipeline = pipeline;
+        memo.sync_flushes = gen_sync;
+        memo.maps = gen_maps;
+        memo.arenas = gen_arenas;
+        memo.guest = guest_buffers;
+        memo.host_buffers = host_buffers;
+        memo.host_offsets = host_offsets;
+        memo.host_sizes = host_sizes;
+        memo.host_strides = host_strides;
+        memo.ranges.clear();
+        for (const auto& range : ranges_merged) {
+            memo.ranges.push_back({range.buffer, range.offset,
+                                   memory->ClampRangeSize(range.base_address, range.GetSize())});
+        }
+    } else if (memo.pipeline == pipeline) {
+        memo.pipeline = nullptr;
+    }
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset) {
@@ -2214,8 +2285,28 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
-    const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+    const u64 gen_sync = buffer_cache.SyncBatchGeneration();
+    const u64 gen_maps = buffer_cache.MappingGeneration();
+    const u64 gen_arenas = buffer_cache.ArenaGeneration();
+    const VideoCore::Buffer* buffer;
+    u64 offset;
+    if (vertex_memo && index_memo.address == index_address &&
+        index_memo.size == index_buffer_size && index_memo.sync_flushes == gen_sync &&
+        index_memo.maps == gen_maps && index_memo.arenas == gen_arenas) {
+        ++index_memo_hits;
+        buffer = index_memo.buffer;
+        offset = index_memo.offset;
+    } else {
+        ++index_memo_misses;
+        std::tie(buffer, offset) =
+            buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+        if (vertex_memo && buffer != &buffer_cache.GetStreamBuffer()) {
+            index_memo = {index_address, index_buffer_size, gen_sync, gen_maps,
+                          gen_arenas,    buffer,            offset};
+        } else {
+            index_memo.address = 0;
+        }
+    }
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
@@ -2483,7 +2574,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 auto& memo =
                     flat_memo[(reinterpret_cast<uintptr_t>(&stage) >> 4) % flat_memo.size()];
                 const u64 tick = scheduler.CurrentTick();
-                if (stream_reuse && memo.stage == &stage && memo.tick == tick &&
+                const u64 head = vk_buffer.Head();
+                const bool memo_alive =
+                    stream_reuse_distance != 0
+                        ? memo.pos != ~0ULL && head - memo.pos < stream_reuse_distance
+                        : memo.tick == tick;
+                if (stream_reuse && memo.stage == &stage && memo_alive &&
                     memo.data.size() == flat.size() &&
                     std::memcmp(memo.data.data(), flat.data(), ubo_size) == 0) {
                     offset = memo.offset;
@@ -2493,6 +2589,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     if (stream_reuse) {
                         memo.stage = &stage;
                         memo.tick = tick;
+                        memo.pos = vk_buffer.AbsolutePosition(offset);
                         memo.offset = offset;
                         memo.data.assign(flat.begin(), flat.end());
                     }
@@ -2556,7 +2653,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
-                    texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                    auto& no_image = no_image_memo[(vsharp.base_address >> 8) % no_image_memo.size()];
+                    const u64 image_sets = texture_cache.ImageSetGeneration();
+                    if (!vertex_memo || no_image.address != vsharp.base_address ||
+                        no_image.size != size || no_image.image_sets != image_sets) {
+                        if (!texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size)) {
+                            no_image = {vsharp.base_address, size, image_sets};
+                        } else {
+                            no_image.address = 0;
+                        }
+                    }
                     Common::GuestWriteJournal::Record(
                         Common::GuestWriteJournal::Source::WrittenBinding, vsharp.base_address,
                         size, nullptr, stage.pgm_hash);
@@ -2585,7 +2691,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             const bool reuse = slot && !desc.is_written && slot->Matches(vsharp, bind_generations);
             const bool stream_hit =
                 stream_reuse && slot && !desc.is_written && !reuse &&
-                slot->StreamMatches(vsharp, scheduler.CurrentTick(), bind_generations.maps) &&
+                slot->StreamMatches(vsharp, scheduler.CurrentTick(), bind_generations.maps,
+                                    buffer_cache.GetStreamBuffer().Head(),
+                                    stream_reuse_distance) &&
                 !buffer_cache.IsRegionGpuModified(vsharp.base_address, slot->stream_size) &&
                 memory->BackingEquals(vsharp.base_address, slot->stream_data.data(),
                                       slot->stream_size);
@@ -2675,6 +2783,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         buffer = &stream_buffer;
                         slot->stream_sharp = vsharp;
                         slot->stream_tick = scheduler.CurrentTick();
+                        slot->stream_pos = stream_buffer.AbsolutePosition(offset);
                         slot->stream_offset = offset;
                         slot->stream_maps = bind_generations.maps;
                         slot->stream_size = static_cast<u32>(size);

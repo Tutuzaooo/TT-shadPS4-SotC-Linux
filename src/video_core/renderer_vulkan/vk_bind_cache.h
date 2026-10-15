@@ -64,12 +64,18 @@ struct BindCache {
         AmdGpu::Buffer stream_sharp{};
         u64 stream_tick{~0ULL};
         u64 stream_offset{};
+        u64 stream_pos{~0ULL};
         u64 stream_maps{};
         u32 stream_size{};
         std::vector<u8> stream_data;
 
-        bool StreamMatches(const AmdGpu::Buffer& vsharp, u64 tick, u64 maps_now) const {
-            return stream_tick == tick && stream_maps == maps_now &&
+        /// `max_distance` 0: the same command buffer only. Otherwise (experimental, PINK_STREAM_
+        /// REUSE_TICKS) any later one while fewer bytes than that were written to the ring since
+        bool StreamMatches(const AmdGpu::Buffer& vsharp, u64 tick, u64 maps_now, u64 head,
+                           u64 max_distance) const {
+            const bool alive = max_distance != 0 ? stream_pos != ~0ULL && head - stream_pos < max_distance
+                                                 : stream_tick == tick;
+            return alive && stream_maps == maps_now &&
                    std::memcmp(&stream_sharp, &vsharp, sizeof(vsharp)) == 0;
         }
 

@@ -233,8 +233,9 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     });
 }
 
-void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+bool TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     std::scoped_lock lock{mutex};
+    bool found = false;
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
@@ -243,7 +244,9 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        found = true;
     });
+    return found;
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
