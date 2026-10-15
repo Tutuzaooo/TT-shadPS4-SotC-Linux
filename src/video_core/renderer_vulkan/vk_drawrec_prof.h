@@ -38,9 +38,19 @@ inline std::array<std::atomic<u64>, Count> cycles{};
 inline std::atomic<u64> draws{};
 
 /// Buffer bindings by the path they took: their count and cycles (the whole loop iteration)
-enum BufferPath : u32 { PathSpecial, PathReused, PathStream, PathArena, PathWritten, PathNull, NumPaths };
-inline constexpr std::array<const char*, NumPaths> PathNames = {"special", "reused", "stream",
-                                                                 "arena",   "written", "null"};
+enum BufferPath : u32 {
+    PathSpecial,
+    PathFlatReused,
+    PathReused,
+    PathStream,
+    PathStreamReused,
+    PathArena,
+    PathWritten,
+    PathNull,
+    NumPaths
+};
+inline constexpr std::array<const char*, NumPaths> PathNames = {
+    "special", "user data reused", "reused", "stream", "stream reused", "arena", "written", "null"};
 inline std::array<std::atomic<u64>, NumPaths> path_count{};
 inline std::array<std::atomic<u64>, NumPaths> path_cycles{};
 inline std::atomic<u64> stream_copies{};

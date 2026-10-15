@@ -416,6 +416,16 @@ private:
     const bool incremental_bind_verify;
     BindCache* bind_cache{};
     BindCache::Generations bind_generations{};
+    /// PINK_STREAM_REUSE (default on): small read-only buffers and flattened user data whose bytes
+    /// match their last copy into the stream buffer in the same command buffer bind that copy again
+    bool stream_reuse{};
+    struct FlatMemo {
+        const void* stage{};
+        u64 tick{~0ULL};
+        u64 offset{};
+        std::vector<u32> data;
+    };
+    std::array<FlatMemo, 512> flat_memo{};
     u32 bind_cache_buffer_index{};
     u32 bind_cache_image_index{};
     // Share T# resolutions across pipelines and remember whether that cache is enabled for the

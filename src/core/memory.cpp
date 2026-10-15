@@ -165,6 +165,23 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
+bool MemoryManager::BackingEquals(VAddr virtual_addr, const u8* data, u64 size) const {
+    const auto& backing_pages = impl.BackingPages();
+    while (size) {
+        const u64 page = virtual_addr >> 14;
+        const u64 offset_in_page = virtual_addr % 16_KB;
+        const u64 chunk = std::min<u64>(16_KB - offset_in_page, size);
+        const auto* entry = backing_pages.find(page);
+        if (!entry || !*entry || std::memcmp(*entry + offset_in_page, data, chunk) != 0) {
+            return false;
+        }
+        size -= chunk;
+        virtual_addr += chunk;
+        data += chunk;
+    }
+    return true;
+}
+
 const u8* MemoryManager::GetBackingPointer(VAddr virtual_addr) const {
     if (virtual_addr >> AddressSpace::Traits::ADDRESS_SPACE_BITS) {
         return nullptr;

@@ -227,10 +227,10 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         return fallback(2);
     }
     if (max_bytes != 0 && count * 4 > max_bytes) {
-        // PINK_FILL_MIRROR=0: the large fills stay on the GPU only
+        // PINK_FILL_MIRROR=1: the large fills also go to guest memory (off by default)
         static const bool mirror = [] {
             const char* v = std::getenv("PINK_FILL_MIRROR");
-            return !v || v[0] != '0';
+            return v && v[0] == '1';
         }();
         if (mirror) {
             pending_mirror = {dst.base_address, count, std::bit_cast<const u32*>(src.base_address),

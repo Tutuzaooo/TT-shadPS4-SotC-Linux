@@ -689,6 +689,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         }
         LOG_WARNING(Render_Vulkan, "Direct draws from CPU arguments: {}",
                     direct_draws ? "on" : "off");
+        stream_reuse = [] {
+            const char* v = std::getenv("PINK_STREAM_REUSE");
+            return !v || v[0] != '0';
+        }();
+        LOG_WARNING(Render_Vulkan, "Stream copy reuse: {}", stream_reuse ? "on" : "off");
         if (track_pending_writes) {
             pending_granules =
                 std::make_unique<u32[]>(u64{1} << (40 - PendingGranuleBits));
@@ -2472,9 +2477,26 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
-                const u32 ubo_size = stage.FlatUserData().size() * sizeof(u32);
-                const u64 offset =
-                    vk_buffer.Copy(stage.FlatUserData().data(), ubo_size, alignment);
+                const auto flat = stage.FlatUserData();
+                const u32 ubo_size = flat.size() * sizeof(u32);
+                u64 offset;
+                auto& memo =
+                    flat_memo[(reinterpret_cast<uintptr_t>(&stage) >> 4) % flat_memo.size()];
+                const u64 tick = scheduler.CurrentTick();
+                if (stream_reuse && memo.stage == &stage && memo.tick == tick &&
+                    memo.data.size() == flat.size() &&
+                    std::memcmp(memo.data.data(), flat.data(), ubo_size) == 0) {
+                    offset = memo.offset;
+                    path = DrawRecProf::PathFlatReused;
+                } else {
+                    offset = vk_buffer.Copy(flat.data(), ubo_size, alignment);
+                    if (stream_reuse) {
+                        memo.stage = &stage;
+                        memo.tick = tick;
+                        memo.offset = offset;
+                        memo.data.assign(flat.begin(), flat.end());
+                    }
+                }
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
@@ -2527,6 +2549,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
+                // The GPU never writes the copies in the stream buffer: no barriers to track
+                if (stream_reuse && !desc.is_written && buffer == &buffer_cache.GetStreamBuffer()) {
+                    return;
+                }
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
@@ -2557,7 +2583,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             BindCache::BufferSlot* slot =
                 bind_cache ? &bind_cache->Buffer(bind_cache_buffer_index++) : nullptr;
             const bool reuse = slot && !desc.is_written && slot->Matches(vsharp, bind_generations);
-            if (reuse && !incremental_bind_verify) {
+            const bool stream_hit =
+                stream_reuse && slot && !desc.is_written && !reuse &&
+                slot->StreamMatches(vsharp, scheduler.CurrentTick(), bind_generations.maps) &&
+                !buffer_cache.IsRegionGpuModified(vsharp.base_address, slot->stream_size) &&
+                memory->BackingEquals(vsharp.base_address, slot->stream_data.data(),
+                                      slot->stream_size);
+            if (stream_hit) {
+                path = DrawRecProf::PathStreamReused;
+                bind_range(&buffer_cache.GetStreamBuffer(), slot->stream_offset, slot->stream_size);
+            } else if (reuse && !incremental_bind_verify) {
                 path = DrawRecProf::PathReused;
                 buffer_cache.ReuseReadBuffer(slot->arena, vsharp.base_address, slot->size,
                                              desc.is_formatted);
@@ -2622,8 +2657,31 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                                size - unbounded_cap_bytes);
                         size = unbounded_cap_bytes;
                     }
-                    const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                        vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                    // PINK_STREAM_REUSE: the stream copy is made from a saved copy of the bytes,
+                    // so later binds can tell whether guest memory still holds what it has
+                    const bool own_stream =
+                        stream_reuse && slot && !desc.is_written &&
+                        size <= VideoCore::BufferCache::STREAM_THRESHOLD &&
+                        !buffer_cache.IsRegionGpuModified(vsharp.base_address, size);
+                    const VideoCore::Buffer* buffer;
+                    u64 offset;
+                    if (own_stream) {
+                        slot->stream_data.resize(size);
+                        memory->CopySparseMemory(vsharp.base_address, slot->stream_data.data(),
+                                                 size);
+                        auto& stream_buffer = buffer_cache.GetStreamBuffer();
+                        offset = stream_buffer.Copy(slot->stream_data.data(), size,
+                                                    instance.UniformMinAlignment());
+                        buffer = &stream_buffer;
+                        slot->stream_sharp = vsharp;
+                        slot->stream_tick = scheduler.CurrentTick();
+                        slot->stream_offset = offset;
+                        slot->stream_maps = bind_generations.maps;
+                        slot->stream_size = static_cast<u32>(size);
+                    } else {
+                        std::tie(buffer, offset) = buffer_cache.ObtainBuffer(
+                            vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                    }
                     const bool stream = buffer == &buffer_cache.GetStreamBuffer();
                     path = desc.is_written ? DrawRecProf::PathWritten
                            : stream        ? DrawRecProf::PathStream

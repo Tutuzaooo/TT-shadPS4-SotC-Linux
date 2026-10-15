@@ -49,9 +49,11 @@ class BufferCache {
     static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
     static constexpr u64 NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - ARENA_PAGE_BITS);
     static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
-    static constexpr u64 STREAM_THRESHOLD = 16_KB;
 
 public:
+    /// Read-only bindings up to this size not written by the GPU are copied to the stream buffer
+    static constexpr u64 STREAM_THRESHOLD = 16_KB;
+
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
                          TextureCache& texture_cache, PageManager& tracker);

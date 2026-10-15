@@ -59,6 +59,20 @@ struct BindCache {
         u64 maps{};
         u64 arenas{};
 
+        /// PINK_STREAM_REUSE: the last copy of this read-only V# into the stream buffer, while
+        /// the same command buffer is recorded (its stream range stays reserved until then)
+        AmdGpu::Buffer stream_sharp{};
+        u64 stream_tick{~0ULL};
+        u64 stream_offset{};
+        u64 stream_maps{};
+        u32 stream_size{};
+        std::vector<u8> stream_data;
+
+        bool StreamMatches(const AmdGpu::Buffer& vsharp, u64 tick, u64 maps_now) const {
+            return stream_tick == tick && stream_maps == maps_now &&
+                   std::memcmp(&stream_sharp, &vsharp, sizeof(vsharp)) == 0;
+        }
+
         bool Matches(const AmdGpu::Buffer& vsharp, const Generations& now) const {
             return arena && sync_flushes == now.sync_flushes && maps == now.maps &&
                    arenas == now.arenas && std::memcmp(&sharp, &vsharp, sizeof(sharp)) == 0;
