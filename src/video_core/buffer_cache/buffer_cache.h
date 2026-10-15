@@ -142,6 +142,9 @@ public:
     /// Returns a reason code: 0 written, 1 GPU-written bytes elsewhere on its pages,
     /// 2 stack pages, 3 not backed. Draw recording thread (or command processor) only
     u32 TryReplaceFromCpu(VAddr addr, const void* data, u64 size);
+    /// Same, for the fill HLE: writes dst[i] = src[i % pattern] for i < count (32-bit elements)
+    /// straight into the backing, page by page, without a staging copy
+    u32 TryFillFromCpu(VAddr addr, u64 count, const u32* src, u64 pattern);
 
     enum class CleanRead { Served, GpuWritten, Miss };
     /// Clean reads (Rasterizer::ReadCleanMemory) of [addr, addr + size), within one 4 KiB page, from a cache

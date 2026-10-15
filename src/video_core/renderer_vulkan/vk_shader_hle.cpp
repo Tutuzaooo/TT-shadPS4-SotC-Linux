@@ -121,10 +121,10 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
 static constexpr u64 REPLICATE_SHADER_HASH = 0x50784801;
 
 namespace FillStats {
-std::atomic<u64> done{}, bytes{}, gpu{};
+std::atomic<u64> done{}, bytes{}, gpu{}, big{}, big_bytes{}, ns{};
 std::array<std::atomic<u64>, 8> fallback{};
 // 0 shape, 1 control GPU-written, 2 source GPU-written, 3 foreign GPU bytes on the pages,
-// 4 stack pages, 5 not backed
+// 4 stack pages, 5 not backed, 6 over PINK_FILL_HLE_MAX_KB
 void Report() {
     static auto last = std::chrono::steady_clock::now();
     static u32 calls = 0;
@@ -142,12 +142,14 @@ void Report() {
         f[i] = fallback[i].exchange(0, std::memory_order_relaxed);
     }
     LOG_WARNING(Render_Vulkan,
-                "Fill HLE: {:.0f}/s on the CPU ({:.0f} KB/s), {:.0f}/s on the GPU; fallbacks/s: "
-                "shape {:.0f}, control {:.0f}, source {:.0f}, pages {:.0f}, stack {:.0f}, "
-                "backing {:.0f}",
+                "Fill HLE: {:.0f}/s on the CPU ({:.0f} KB/s, {:.1f} ms/s; over 64 KiB: {:.0f}/s, "
+                "{:.0f} KB/s), {:.0f}/s on the GPU; fallbacks/s: shape {:.0f}, control {:.0f}, "
+                "source {:.0f}, pages {:.0f}, stack {:.0f}, backing {:.0f}, size cap {:.0f}",
                 done.exchange(0) / seconds, bytes.exchange(0) / 1024.0 / seconds,
-                gpu.exchange(0) / seconds, f[0] / seconds, f[1] / seconds, f[2] / seconds,
-                f[3] / seconds, f[4] / seconds, f[5] / seconds);
+                ns.exchange(0) / 1e6 / seconds, big.exchange(0) / seconds,
+                big_bytes.exchange(0) / 1024.0 / seconds, gpu.exchange(0) / seconds,
+                f[0] / seconds, f[1] / seconds, f[2] / seconds, f[3] / seconds, f[4] / seconds,
+                f[5] / seconds, f[6] / seconds);
 }
 } // namespace FillStats
 
@@ -200,21 +202,21 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     if (src_count * 4 > src.GetSize()) {
         return fallback(0);
     }
+    // PINK_FILL_HLE_MAX_KB=<n>: larger fills stay on the GPU (0, the default: no limit)
+    static const u64 max_bytes = [] {
+        const char* v = std::getenv("PINK_FILL_HLE_MAX_KB");
+        return v ? std::strtoull(v, nullptr, 10) * 1024 : 0;
+    }();
+    if (max_bytes != 0 && count * 4 > max_bytes) {
+        return fallback(6);
+    }
     if (buffer_cache.IsRegionGpuModified(src.base_address, src_count * 4)) {
         return fallback(2);
     }
-    static std::vector<u32> data;
-    data.resize(count);
+    const auto start = std::chrono::steady_clock::now();
     const u32* source = std::bit_cast<const u32*>(src.base_address);
-    // The pattern of src_count elements, repeated (no division per element)
-    std::memcpy(data.data(), source, src_count * 4);
-    for (u64 filled = src_count; filled < count;) {
-        const u64 chunk = std::min(filled, count - filled);
-        std::memcpy(data.data() + filled, data.data(), chunk * 4);
-        filled += chunk;
-    }
     const VAddr address = dst.base_address;
-    if (const u32 reason = buffer_cache.TryReplaceFromCpu(address, data.data(), count * 4);
+    if (const u32 reason = buffer_cache.TryFillFromCpu(address, count, source, src_count);
         reason != 0) {
         return fallback(reason + 2);
     }
@@ -227,6 +229,14 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     }
     FillStats::done.fetch_add(1, std::memory_order_relaxed);
     FillStats::bytes.fetch_add(count * 4, std::memory_order_relaxed);
+    if (count * 4 > 64 * 1024) {
+        FillStats::big.fetch_add(1, std::memory_order_relaxed);
+        FillStats::big_bytes.fetch_add(count * 4, std::memory_order_relaxed);
+    }
+    FillStats::ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count(),
+                            std::memory_order_relaxed);
     return true;
 }
 
