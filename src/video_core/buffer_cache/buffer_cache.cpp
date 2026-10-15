@@ -861,6 +861,41 @@ void BufferCache::AddGpuModified(VAddr addr, u64 size, bool fast) {
     }
 }
 
+u32 BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
+    if (size == 0) {
+        return 0;
+    }
+    // Page tracking is page granular: GPU-written bytes elsewhere on these pages would be lost
+    const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+    const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
+    bool foreign = false;
+    bool inside = false;
+    gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
+        foreign |= start < addr || end > addr + size;
+        inside = true;
+    });
+    if (foreign) {
+        return 1;
+    }
+    if (!memory->GetStackRangesIn(lo, hi - lo).empty()) {
+        return 2;
+    }
+    if (inside) {
+        // GPU writes of these bytes may still be in the command buffer being recorded: submit it,
+        // so the upload of the CPU data below cannot run before them
+        scheduler.Flush();
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
+    SubtractGpuModified(addr, size);
+    InvalidateCleanPages(addr, size);
+    if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size)) {
+        memory_tracker->MarkRegionAsCpuModified(addr, size);
+        return 3;
+    }
+    memory_tracker->MarkRegionAsCpuModified(addr, size);
+    return 0;
+}
+
 void BufferCache::SubtractGpuModified(VAddr addr, u64 size) {
     {
         const CleanGuard guard{*this};

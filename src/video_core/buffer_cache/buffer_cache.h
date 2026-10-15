@@ -137,6 +137,12 @@ public:
         return gpu_modified_ranges.Intersects(addr, size);
     }
 
+    /// Fill HLE (PINK_FILL_HLE): the CPU computed all of [addr, addr + size), as a compute
+    /// shader would have written it. Writes it to guest memory and leaves the range CPU-modified.
+    /// Returns a reason code: 0 written, 1 GPU-written bytes elsewhere on its pages,
+    /// 2 stack pages, 3 not backed. Draw recording thread (or command processor) only
+    u32 TryReplaceFromCpu(VAddr addr, const void* data, u64 size);
+
     enum class CleanRead { Served, GpuWritten, Miss };
     /// Clean reads (Rasterizer::ReadCleanMemory) of [addr, addr + size), within one 4 KiB page, from a cache
     /// of pages that holds their backing pointer and the hull of their GPU-written bytes. On Miss the caller

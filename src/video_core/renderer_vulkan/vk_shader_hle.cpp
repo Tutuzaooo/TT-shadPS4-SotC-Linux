@@ -1,10 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <bit>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/texture_cache/texture_cache.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
@@ -103,11 +111,132 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     return true;
 }
 
+// Shadow of the Colossus fills small tables every frame with a compute shader:
+// dst[i] = src[i % m] (32-bit elements) for i < min(n, user SGPR 6, the dispatched threads),
+// n and m read from the constant buffer. The command processor then reads those tables (SRT
+// walker), and with the shader on the GPU every such read waits for the GPU (readback). With a
+// CPU-written source the fill is done here, in command order, so the tables stay CPU-side.
+// After the SotC PC port (vk_shader_hle.cpp, SOTC_FILL_HLE): about a third of its readbacks.
+// PINK_FILL_HLE=0 runs the shader on the GPU.
+static constexpr u64 REPLICATE_SHADER_HASH = 0x50784801;
+
+namespace FillStats {
+std::atomic<u64> done{}, bytes{}, gpu{};
+std::array<std::atomic<u64>, 8> fallback{};
+// 0 shape, 1 control GPU-written, 2 source GPU-written, 3 foreign GPU bytes on the pages,
+// 4 stack pages, 5 not backed
+void Report() {
+    static auto last = std::chrono::steady_clock::now();
+    static u32 calls = 0;
+    if ((++calls & 63) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - last).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    last = now;
+    u64 f[8];
+    for (u32 i = 0; i < 8; ++i) {
+        f[i] = fallback[i].exchange(0, std::memory_order_relaxed);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "Fill HLE: {:.0f}/s on the CPU ({:.0f} KB/s), {:.0f}/s on the GPU; fallbacks/s: "
+                "shape {:.0f}, control {:.0f}, source {:.0f}, pages {:.0f}, stack {:.0f}, "
+                "backing {:.0f}",
+                done.exchange(0) / seconds, bytes.exchange(0) / 1024.0 / seconds,
+                gpu.exchange(0) / seconds, f[0] / seconds, f[1] / seconds, f[2] / seconds,
+                f[3] / seconds, f[4] / seconds, f[5] / seconds);
+}
+} // namespace FillStats
+
+static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
+                                      const AmdGpu::ComputeProgram& cs_program,
+                                      Rasterizer& rasterizer) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PINK_FILL_HLE");
+        const bool on = !v || v[0] != '0';
+        LOG_WARNING(Render_Vulkan, "Fill HLE (cs {:#x} on the CPU): {}", REPLICATE_SHADER_HASH,
+                    on ? "on" : "off");
+        return on;
+    }();
+    FillStats::Report();
+    const auto fallback = [](u32 reason) {
+        FillStats::fallback[reason].fetch_add(1, std::memory_order_relaxed);
+        FillStats::gpu.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (!enabled) {
+        FillStats::gpu.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (info.buffers.size() < 3 || cs_program.dim_y > 1 || cs_program.dim_z > 1) {
+        return fallback(0);
+    }
+    auto& buffer_cache = rasterizer.GetBufferCache();
+    const auto ctl = info.buffers[0].GetSharp(info);
+    const auto src = info.buffers[1].GetSharp(info);
+    const auto dst = info.buffers[2].GetSharp(info);
+    const u32 src_stride = src.GetStride() ? src.GetStride() : 4;
+    const u32 dst_stride = dst.GetStride() ? dst.GetStride() : 4;
+    if (src_stride != 4 || dst_stride != 4 || ctl.GetSize() < 8 || ctl.base_address <= 1 ||
+        src.base_address <= 1 || dst.base_address <= 1) {
+        return fallback(0);
+    }
+    if (buffer_cache.IsRegionGpuModified(ctl.base_address, 8)) {
+        return fallback(1);
+    }
+    const u32* control = std::bit_cast<const u32*>(ctl.base_address);
+    const u32 n = control[0];
+    const u32 m = control[1];
+    const u64 threads = u64(cs_program.dim_x) * 64;
+    const u64 count = std::min<u64>({n, cs_program.user_data[6], threads, dst.GetSize() / 4});
+    if (count == 0) {
+        FillStats::done.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    const u64 src_count = m ? std::min<u64>(m, count) : count;
+    if (src_count * 4 > src.GetSize()) {
+        return fallback(0);
+    }
+    if (buffer_cache.IsRegionGpuModified(src.base_address, src_count * 4)) {
+        return fallback(2);
+    }
+    static std::vector<u32> data;
+    data.resize(count);
+    const u32* source = std::bit_cast<const u32*>(src.base_address);
+    // The pattern of src_count elements, repeated (no division per element)
+    std::memcpy(data.data(), source, src_count * 4);
+    for (u64 filled = src_count; filled < count;) {
+        const u64 chunk = std::min(filled, count - filled);
+        std::memcpy(data.data() + filled, data.data(), chunk * 4);
+        filled += chunk;
+    }
+    const VAddr address = dst.base_address;
+    if (const u32 reason = buffer_cache.TryReplaceFromCpu(address, data.data(), count * 4);
+        reason != 0) {
+        return fallback(reason + 2);
+    }
+    rasterizer.GetTextureCache().InvalidateMemory(address, count * 4);
+    static u32 logged = 0;
+    if (logged < 6) {
+        ++logged;
+        LOG_WARNING(Render_Vulkan, "Fill HLE: {:#x}+{:#x} from {:#x} ({} source elements)",
+                    address, count * 4, src.base_address, src_count);
+    }
+    FillStats::done.fetch_add(1, std::memory_order_relaxed);
+    FillStats::bytes.fetch_add(count * 4, std::memory_order_relaxed);
+    return true;
+}
+
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
+    case REPLICATE_SHADER_HASH:
+        return ExecuteReplicateShaderHLE(info, cs_program, rasterizer);
     default:
         return false;
     }
