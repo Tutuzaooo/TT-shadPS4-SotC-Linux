@@ -22,7 +22,6 @@ The ZIP already includes the launcher and emulator with specific settings for th
 
 #### NVIDIA and AMD
 
-- **Workarounds > Command recording cuts:** turn this on for some extra FPS. It may cause occasional hiccups or rare graphical glitches, so turn it off for a more stable experience.
 - **General > Additional DMMem allocation:** `0` by default. `256 MB` may help if your system has memory to spare.
 
 #### Additional AMD settings
