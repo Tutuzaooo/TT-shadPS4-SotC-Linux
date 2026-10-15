@@ -242,6 +242,29 @@ static void WriteLabel(void* address, u64 data, u32 num_bytes, u64 queue, bool l
                 fmt::ptr(address));
 }
 
+/// RELEASE_MEM writes directly, so drop recording-thread writes to guest labels unmapped since decode; UnmapMemory waits for published
+/// packets, leaving only a guest race here
+static bool ReleaseMemLabelUnmapped(const PM4CmdReleaseMem& packet) {
+    u64 num_bytes;
+    switch (packet.data_sel.Value()) {
+    case DataSelect::Data32Low:
+        num_bytes = sizeof(u32);
+        break;
+    case DataSelect::Data64:
+    case DataSelect::GpuClock64:
+    case DataSelect::PerfCounter:
+        num_bytes = sizeof(u64);
+        break;
+    default:
+        // GdsMemStore copies on the GPU
+        return false;
+    }
+    const auto address = packet.Address<VAddr>();
+    auto* const memory = Core::Memory::Instance();
+    return memory->IsValidMappingLocked(address, num_bytes) &&
+           !memory->IsMappedLocked(address, num_bytes);
+}
+
 namespace CpHistory {
 
 namespace {
@@ -1845,19 +1868,28 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     rasterizer->NetPendingWrite(label_addr, u64{packet.num_dw} * sizeof(u32));
                 }
             }
-            const auto fence = [this, packet, pipe_id = queue.pipe_id, label_addr, seq] {
+            const auto fence = [this, packet, pipe_id = queue.pipe_id, label_addr, seq, pipe_task] {
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
-                packet.SignalFence(
-                    [pipe_id] {
-                        Platform::IrqC::Instance()->Signal(
-                            static_cast<Platform::InterruptId>(pipe_id));
-                    },
-                    [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                        rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
-                                               true);
-                    });
+                const auto signal_irq = [pipe_id] {
+                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+                };
+                if (pipe_task && ReleaseMemLabelUnmapped(packet)) {
+                    // Drop the label like EOP, but still raise the interrupt
+                    LOG_WARNING(Render,
+                                "Label {:#x} unmapped before its write (draw_pipe_steps), dropped",
+                                label_addr);
+                    if (packet.int_sel.Value() != InterruptSelect::None) {
+                        signal_irq();
+                    }
+                } else {
+                    packet.SignalFence(
+                        signal_irq, [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                            rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
+                                                   true);
+                        });
+                }
                 if (seq != 0) {
                     DelayedLabels::RemovePending(label_addr, seq);
                 }
