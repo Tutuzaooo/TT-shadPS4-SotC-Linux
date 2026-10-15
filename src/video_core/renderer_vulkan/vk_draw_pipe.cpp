@@ -118,6 +118,10 @@ void DrawPipe::Run(std::stop_token stop) {
     Common::SetCurrentThreadName("shadPS4:DrawRec");
     Common::PerfStats::MarkDrawRecordThread();
     on_stage_b = true;
+    // Cache these values locally because the opaque handler call would otherwise reload members for every packet
+    const Handler run_packet = handler;
+    void* const run_context = context;
+    const u8* const base = ring.get();
     u64 at = 0;
     while (true) {
         u64 available = published.load(std::memory_order_acquire);
@@ -141,7 +145,7 @@ void DrawPipe::Run(std::stop_token stop) {
                 available = published.load(std::memory_order_acquire);
             }
         }
-        const auto* header = reinterpret_cast<const Header*>(ring.get() + at % Capacity);
+        const auto* header = reinterpret_cast<const Header*>(base + at % Capacity);
         if (header->size == 0) {
             at += Capacity - at % Capacity;
             consumed.store(at, std::memory_order_release);
@@ -151,7 +155,7 @@ void DrawPipe::Run(std::stop_token stop) {
             const Common::PerfStats::ScopedNs busy{Common::PerfStats::Id::PipeBusyNs};
             // Log task failures like command processor exceptions instead of silently reaching std::terminate
             try {
-                handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
+                run_packet(run_context, reinterpret_cast<const u8*>(header + 1), header->payload);
             } catch (const std::exception& e) {
                 UNREACHABLE_MSG("draw_pipe: unhandled exception on the draw recording thread: {}",
                                 e.what());

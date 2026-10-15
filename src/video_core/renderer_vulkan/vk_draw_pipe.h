@@ -90,10 +90,12 @@ private:
     static inline std::atomic<DrawPipe*> active{};
     static inline thread_local bool on_stage_a = false;
     static inline thread_local bool on_stage_b = false;
+    /// Initialized once and read by both stages
     Handler handler;
     void* context;
     std::unique_ptr<u8[]> ring;
-    u64 head = 0; ///< Stage A's current write offset
+    /// Keep stage A's per-packet writes on a separate cache line from stage B's reads
+    alignas(64) u64 head = 0; ///< Stage A's current write offset
     u32 pending_size = 0;
     u64 packets = 0;
     alignas(64) std::atomic<u64> published{0};
