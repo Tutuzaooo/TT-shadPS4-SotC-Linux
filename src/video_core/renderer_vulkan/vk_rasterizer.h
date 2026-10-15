@@ -239,7 +239,8 @@ private:
         u32 offset;
         u32 stride; ///< size of the arguments for a dispatch
         u32 max_count;
-        u32 pad;
+        u32 direct; ///< direct_args holds the draw's arguments: record a direct draw
+        std::array<u32, 5> direct_args;
     };
     [[nodiscard]] bool UseDrawPipe() const noexcept {
         return pipe_mode != PipeMode::Off;
@@ -256,7 +257,11 @@ private:
     /// The second half of a draw or dispatch: everything after the pipeline was selected
     void DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
     void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed, VAddr arg_address,
-                            u32 offset, u32 stride, u32 max_count, VAddr count_address);
+                            u32 offset, u32 stride, u32 max_count, VAddr count_address,
+                            const u32* direct_args = nullptr);
+    /// PINK_DIRECT_DRAWS: the arguments of a single indirect draw when they can be read from
+    /// guest memory now, in command order (not GPU-written, no queued packet writes them)
+    bool ReadDirectDrawArgs(VAddr addr, u32 size, u32* out);
     void DispatchRecord(const ComputePipeline* pipeline);
     void DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address, u32 offset,
                                 u32 size);
@@ -496,6 +501,10 @@ private:
     void WaitForPendingWrites(VAddr addr, u64 size);
     u32 pipe_extra{};                        ///< PINK_PIPE_EXTRA
     bool track_pending_writes{};             ///< tracking on (mode 7, "wait" or "ascwait")
+    bool pending_for_srt{};                  ///< the tracking also guards SRT clean reads
+    bool direct_draws{};                     ///< PINK_DIRECT_DRAWS
+    u64 direct_draws_done{};
+    u64 direct_draws_kept{};
     bool ordered_waits_unchecked{};          ///< PINK_PIPE_TRACK=0: skip without tracking
     std::deque<PendingWrite> pending_writes; ///< by position
     std::unique_ptr<u32[]> pending_granules; ///< pending writes per 1 MiB of the address space

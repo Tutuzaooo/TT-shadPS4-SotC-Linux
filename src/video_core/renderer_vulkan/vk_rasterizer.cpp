@@ -673,6 +673,21 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             ordered_waits_unchecked = track_pending_writes;
             track_pending_writes = false;
         }
+        pending_for_srt = track_pending_writes;
+        // PINK_DIRECT_DRAWS=0: single indirect draws whose arguments the CPU wrote stay indirect.
+        // On (default) the command processor thread reads those arguments and the recording
+        // thread records a direct draw: no buffer for the arguments, no barrier between the
+        // game's argument writes and the draws (after the SotC PC port, SOTC_INDIRECT_DIRECT).
+        // Reading them in command order needs the writes still queued for the recording thread
+        direct_draws = [] {
+            const char* v = std::getenv("PINK_DIRECT_DRAWS");
+            return !v || v[0] != '0';
+        }();
+        if (direct_draws && draw_pipe) {
+            track_pending_writes = true;
+        }
+        LOG_WARNING(Render_Vulkan, "Direct draws from CPU arguments: {}",
+                    direct_draws ? "on" : "off");
         if (track_pending_writes) {
             pending_granules =
                 std::make_unique<u32[]>(u64{1} << (40 - PendingGranuleBits));
@@ -782,7 +797,9 @@ struct DrawPacket {
     u32 indirect_offset;
     u32 indirect_stride;
     u32 indirect_max_count;
-    u32 pad2;
+    u32 indirect_direct;
+    std::array<u32, 5> direct_args;
+    u32 pad3;
 };
 static_assert(sizeof(DrawPacket) % 8 == 0);
 struct PacketStage {
@@ -878,6 +895,8 @@ void Rasterizer::PostPacket(PacketKind kind, const Pipeline* pipeline, bool is_i
         packet.indirect_offset = indirect->offset;
         packet.indirect_stride = indirect->stride;
         packet.indirect_max_count = indirect->max_count;
+        packet.indirect_direct = indirect->direct;
+        packet.direct_args = indirect->direct_args;
     }
     out += sizeof(DrawPacket);
     std::memcpy(out, blocks.data(), num_blocks * sizeof(u16));
@@ -993,6 +1012,9 @@ void Rasterizer::TrackPendingWrites(const Pipeline* pipeline, u64 position) {
             }
             // The SRT walkers load other pages straight from memory: send these through the
             // clean-read path, where WaitForPendingWrites sees them (once per range)
+            if (!pending_for_srt) {
+                continue;
+            }
             if (srt_marked_ranges.size() >= 65536) {
                 srt_marked_ranges.clear(); // marking again is harmless
             }
@@ -1045,11 +1067,64 @@ void Rasterizer::WaitForPendingWrites(VAddr addr, u64 size) {
 }
 
 bool Rasterizer::OrderedWaitSafe() const {
-    if (!track_pending_writes) {
+    if (!pending_for_srt) {
         return ordered_waits_unchecked;
     }
     return EmulatorSettings.IsSrtWalkerCleanReads() &&
            draw_pipe->Reached(pending_unbounded_position);
+}
+
+bool Rasterizer::ReadDirectDrawArgs(VAddr addr, u32 size, u32* out) {
+    if (!direct_draws) {
+        return false;
+    }
+    if (draw_pipe) {
+        if (!track_pending_writes || !OnStageA()) {
+            return false;
+        }
+        PrunePendingWrites();
+        if (!draw_pipe->Reached(pending_unbounded_position)) {
+            ++direct_draws_kept;
+            return false;
+        }
+        const VAddr end = addr + size;
+        bool maybe = false;
+        for (u64 g = addr >> PendingGranuleBits; g <= (end - 1) >> PendingGranuleBits; ++g) {
+            maybe |= pending_granules[g] != 0;
+        }
+        if (maybe && std::ranges::any_of(pending_writes, [&](const PendingWrite& write) {
+                return write.start < end && addr < write.end;
+            })) {
+            ++direct_draws_kept;
+            return false;
+        }
+    }
+    // Clean reads only: a GPU-written byte keeps the draw indirect
+    using CleanRead = VideoCore::BufferCache::CleanRead;
+    constexpr u64 PageSize = 4_KB;
+    auto* dst = reinterpret_cast<u8*>(out);
+    for (VAddr current = addr, end = addr + size; current < end;) {
+        const VAddr page_addr = Common::AlignDown(current, PageSize);
+        const u32 chunk = static_cast<u32>(std::min(end, page_addr + PageSize) - current);
+        auto result = buffer_cache.ReadCleanPage(current, dst, chunk);
+        if (result == CleanRead::Miss) {
+            const u64 generation = buffer_cache.MappingGeneration();
+            if (!IsMapped(page_addr, PageSize) ||
+                !buffer_cache.FillCleanPage(page_addr, generation)) {
+                ++direct_draws_kept;
+                return false;
+            }
+            result = buffer_cache.ReadCleanPage(current, dst, chunk);
+        }
+        if (result != CleanRead::Served) {
+            ++direct_draws_kept;
+            return false;
+        }
+        current += chunk;
+        dst += chunk;
+    }
+    ++direct_draws_done;
+    return true;
 }
 
 void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
@@ -1127,7 +1202,8 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         self.DrawIndirectRecord(static_cast<const GraphicsPipeline*>(packet.pipeline),
                                 packet.is_indexed, packet.indirect_address,
                                 packet.indirect_offset, packet.indirect_stride,
-                                packet.indirect_max_count, packet.indirect_count_address);
+                                packet.indirect_max_count, packet.indirect_count_address,
+                                packet.indirect_direct ? packet.direct_args.data() : nullptr);
         break;
     case PacketKind::Dispatch:
         self.DispatchRecord(static_cast<const ComputePipeline*>(packet.pipeline));
@@ -1221,7 +1297,12 @@ void Rasterizer::PrintPipeStats() {
         line += fmt::format("; recording thread busy {:.1f}%; command processor waited {:.1f}%:{}",
                             100.0 * (busy - pipe_stats_busy) / cycles, 100.0 * waited / cycles,
                             reasons);
-        if (pipe_extra != 0 || track_pending_writes || ordered_waits_unchecked) {
+        if (direct_draws) {
+            line += fmt::format("; direct draws {:.0f}/s, kept indirect {:.0f}/s",
+                                direct_draws_done / seconds, direct_draws_kept / seconds);
+            direct_draws_done = direct_draws_kept = 0;
+        }
+        if (pipe_extra != 0 || pending_for_srt || ordered_waits_unchecked) {
             line += fmt::format("; waits met in order {:.0f}/s; pending writes {:.0f}/s, "
                                 "unbounded {:.0f}/s, queued now {}",
                                 pipe_waits_skipped / seconds, pending_writes_tracked / seconds,
@@ -1512,24 +1593,31 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
         return;
     }
+    // One draw whose arguments the CPU wrote: read them now, record a direct draw
+    PipeIndirect indirect = {
+        .address = arg_address,
+        .count_address = count_address,
+        .offset = offset,
+        .stride = stride,
+        .max_count = max_count,
+    };
+    const u32 args_size = is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
+                                     : sizeof(VkDrawIndirectCommand);
+    if (count_address == 0 && max_count == 1 && stride == args_size &&
+        ReadDirectDrawArgs(arg_address + offset, args_size, indirect.direct_args.data())) {
+        indirect.direct = 1;
+    }
     if (pipelined) {
-        const PipeIndirect indirect = {
-            .address = arg_address,
-            .count_address = count_address,
-            .offset = offset,
-            .stride = stride,
-            .max_count = max_count,
-        };
         PostPacket(PacketKind::DrawIndirect, pipeline, is_indexed, 0, &indirect);
         return;
     }
     DrawIndirectRecord(pipeline, is_indexed, arg_address, offset, stride, max_count,
-                       count_address);
+                       count_address, indirect.direct ? indirect.direct_args.data() : nullptr);
 }
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                                     VAddr arg_address, u32 offset, u32 stride, u32 max_count,
-                                    VAddr count_address) {
+                                    VAddr count_address, const u32* direct_args) {
     if (DrawTrace::Instance().Active()) {
         TraceGraphics(DrawRegs(), pipeline, is_indexed ? "DrawIndexedIndirect" : "DrawIndirect",
                       "", memory, buffer_cache, page_manager);
@@ -1544,6 +1632,29 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer();
+    }
+
+    if (direct_args) {
+        if (needs_barrier) {
+            runtime.FlushBarriers();
+        }
+        RefreshImageDescriptorLayouts();
+        pipeline->BindResources(set_writes, push_data);
+        UpdateDynamicState(pipeline, is_indexed);
+        scheduler.BeginRendering(state);
+        const auto cmdbuf = scheduler.CommandBuffer();
+        scheduler.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        CountPipelineBind(cmdbuf, vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        if (is_indexed) {
+            cmdbuf.drawIndexed(direct_args[0], direct_args[1], direct_args[2],
+                               static_cast<s32>(direct_args[3]), direct_args[4]);
+        } else {
+            cmdbuf.draw(direct_args[0], direct_args[1], direct_args[2], direct_args[3]);
+        }
+        DebugState.IncDrawCall();
+        OnGpuCommandRecorded();
+        ResetBindings(false);
+        return;
     }
 
     const auto [buffer, base] =
@@ -3358,7 +3469,7 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
 
 bool Rasterizer::ReadCleanMemory(VAddr addr, void* out, u64 size) {
     // Memory a queued packet writes: wait for it, then the read below finds it GPU-written
-    if (track_pending_writes && OnStageA()) {
+    if (pending_for_srt && OnStageA()) {
         WaitForPendingWrites(addr, size);
     }
     // Page by page through the clean page cache of the buffer cache: SotC serves tens of thousands of these
