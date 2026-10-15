@@ -125,6 +125,14 @@ public:
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
+        // PINK_FAST_BIND (default on): sampled textures take UpdateTarget's lock-free skip too,
+        // which holds while the image is clean, tracked, touched this GC tick and no guest write
+        // or unmap stamped its pages since its last full update. Every bound texture of every
+        // draw came here and took the cache lock
+        if (FastBind()) {
+            UpdateTarget(image_id);
+            return;
+        }
         std::scoped_lock lk{mutex};
         Image& image = slot_images[image_id];
         TrackImage(image_id);
@@ -432,6 +440,22 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
+    /// PINK_FAST_BIND: the samplers GetSampler returned this GC tick, by hash. A hit skips the
+    /// samplers lock, the map lookup and the LRU touch (already done this tick). Cleared when the
+    /// collector frees a sampler
+    struct SamplerMemo {
+        u64 hash{};
+        u64 tick{~0ULL};
+        vk::Sampler handle{};
+    };
+    std::array<SamplerMemo, 128> sampler_memo{};
+    [[nodiscard]] static bool FastBind() noexcept {
+        static const bool on = [] {
+            const char* v = std::getenv("PINK_FAST_BIND");
+            return !v || v[0] != '0';
+        }();
+        return on;
+    }
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
