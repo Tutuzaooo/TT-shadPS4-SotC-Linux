@@ -32,17 +32,37 @@ public:
         return buffer.Handle();
     }
 
-    /// Allocate size bytes at power-of-two alignment on stage A; return the ring offset or nullopt if the GPU still uses that region,
-    /// leaving the binding to stage B
+    /// Use device-local host-visible memory when available, otherwise host memory that the GPU reads over the bus
+    [[nodiscard]] bool IsDeviceLocal() const noexcept {
+        return buffer.is_device_local;
+    }
+
+    /// Before packet copies on stage A, retire known completed stamps once the queue is half full; Allocate alone only retires when out of
+    /// space, which can let frequent submits fill the queue before the ring wraps; this check avoids a driver call
+    void BeginPacket() {
+        full = false;
+        if (stamps_head.load(std::memory_order_relaxed) -
+                stamps_tail.load(std::memory_order_relaxed) >=
+            stamps.size() / 2) {
+            Retire(false);
+        }
+    }
+
+    /// Allocate aligned bytes on stage A or return nullopt while the GPU uses the region; after a refusal, leave the packet's remaining
+    /// bindings to stage B to avoid repeated driver queries
     std::optional<u64> Allocate(u64 size, u64 alignment) {
+        if (full) {
+            return std::nullopt;
+        }
         u64 at = (position + alignment - 1) & ~(alignment - 1);
         if (at % Capacity + size > Capacity) {
             at += Capacity - at % Capacity; // Wrap the allocation to the ring start
         }
         const auto in_use = [&] { return at + size > Capacity && at + size - Capacity > retired; };
         if (in_use()) {
-            Retire();
+            Retire(true);
             if (in_use()) {
+                full = true;
                 return std::nullopt;
             }
         }
@@ -91,11 +111,17 @@ private:
         last_published = end;
     }
 
-    void Retire() {
+    /// Reclaim regions whose submission tick has completed; ask_driver refreshes the known GPU tick at the first unfinished stamp
+    void Retire(bool ask_driver) {
+        const Semaphore& semaphore = *scheduler.GetWorkSemaphore();
         u64 at = stamps_tail.load(std::memory_order_relaxed);
         const u64 head = stamps_head.load(std::memory_order_acquire);
-        while (at < head && scheduler.IsFree(stamps[at % stamps.size()].tick)) {
-            retired = stamps[at % stamps.size()].end;
+        while (at < head) {
+            const StampEntry& stamp = stamps[at % stamps.size()];
+            if (!(ask_driver ? scheduler.IsFree(stamp.tick) : semaphore.IsFree(stamp.tick))) {
+                break;
+            }
+            retired = stamp.end;
             ++at;
         }
         stamps_tail.store(at, std::memory_order_release);
@@ -109,6 +135,7 @@ private:
     VideoCore::Buffer buffer;
     u64 position = 0; ///< Owned by stage A
     u64 retired = 0;  ///< Stage A's end offset for completed GPU work
+    bool full = false; ///< Stage A refused an allocation in this packet
     u64 pending_end = 0, pending_tick = 0, last_published = 0; ///< Owned by stage B
     std::array<StampEntry, 1024> stamps{};
     alignas(64) std::atomic<u64> stamps_head{0}; ///< Written by stage B

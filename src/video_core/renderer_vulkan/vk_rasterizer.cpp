@@ -696,9 +696,15 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             if (constant_ring_verify) {
                 ring_verify_shadow = std::make_unique_for_overwrite<u8[]>(ConstantRing::Capacity);
             }
-            LOG_WARNING(Render_Vulkan, "Workaround constant_ring enabled{}: {} MiB{}",
+            // Without ReBAR, the stream buffer may exhaust device-local host-visible memory and push the ring into host memory; include GPU
+            // time in A/B measurements
+            LOG_WARNING(Render_Vulkan, "Workaround constant_ring enabled{}: {} MiB in {}{}",
                         EmulatorSettings.IsConstantRing() ? "" : " (A/B toggle only)",
-                        ConstantRing::Capacity >> 20, constant_ring_verify ? " (verify)" : "");
+                        ConstantRing::Capacity >> 20,
+                        constant_ring->IsDeviceLocal()
+                            ? "device-local memory"
+                            : "host memory (no room in device-local host-visible memory)",
+                        constant_ring_verify ? " (verify)" : "");
         }
     }
 }
@@ -809,6 +815,9 @@ DrawPacket::Header& Rasterizer::BuildPacket(DrawPacket::Kind kind, const Pipelin
     // Collect ring bindings only for stage B packets and after output ranges are tracked, excluding reads that overlap this packet's writes
     const bool packet_ring =
         in_pipe && constant_ring && pipeline && Common::PerfStats::AbToggleOn(constant_ring_toggle);
+    if (packet_ring) {
+        constant_ring->BeginPacket();
+    }
     // Decide here whether verification needs the full register file on stage B
     const bool verify =
         pipe_verify_interval != 0 && ++pipe_verify_packets % pipe_verify_interval == 0;
@@ -1095,7 +1104,12 @@ void Rasterizer::VerifyRingBinding(const Shader::Info& stage, const DrawPacket::
     ring_verify_bytes.resize(ring.size);
     memory->CopySparseMemory(ring.address, ring_verify_bytes.data(), ring.size);
     const u8* copied = ring_verify_shadow.get() + ring.offset;
-    const bool gpu_written = buffer_cache.IsRangeGpuWritten(ring.address, ring.size);
+    // Exclude CPU-authoritative stacks; old written ranges can remain after tracking marks are cleared, while the stream path still copies
+    // those bytes
+    bool gpu_written = false;
+    for (const auto& [lo, len] : memory->SubtractStackRanges(ring.address, ring.size)) {
+        gpu_written |= buffer_cache.IsRangeGpuWritten(lo, len);
+    }
     const bool differs = std::memcmp(copied, ring_verify_bytes.data(), ring.size) != 0;
     ++ring_verify_checks;
     Common::PerfStats::Add(Id::RingVerifyChecks);

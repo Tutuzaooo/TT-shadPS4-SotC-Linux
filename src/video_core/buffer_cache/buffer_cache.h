@@ -141,9 +141,8 @@ public:
     /// marks them
     [[nodiscard]] bool IsRegionGpuModifiedTrackedAnyThread(VAddr addr, u64 size);
 
-    /// Byte-precise: true when a written binding covered any byte of the range since its last readback.
-    /// Readbacks copy only these bytes, so the backing already holds the value of every other byte.
-    /// Command processor thread only
+    /// Check whether a written binding touched any byte since the last readback; readbacks copy only those bytes, and the backing is
+    /// already current elsewhere; call on the active recording thread
     [[nodiscard]] bool IsRangeGpuWritten(VAddr addr, size_t size) const {
         return gpu_modified_ranges.Intersects(addr, size);
     }

@@ -125,6 +125,7 @@ struct Buffer {
     size_t size_bytes = 0;
     std::span<u8> mapped_data{};
     bool is_coherent{};
+    bool is_device_local{}; ///< Memory location chosen for the allocation; Stream buffers may use host memory
     MemoryType mem_type{MemoryType::DeviceLocal};
     UniqueBuffer buffer;
 };
