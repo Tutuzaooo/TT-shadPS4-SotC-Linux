@@ -16,7 +16,9 @@ ResourcePool::ResourcePool(Semaphore* work_semaphore_, std::size_t grow_step_)
 
 std::size_t ResourcePool::CommitResource() {
     u64 gpu_tick = work_semaphore->KnownGpuTick();
-    const auto search = [this, gpu_tick](std::size_t begin,
+    // By reference: the second search below must see the tick refreshed after Refresh(), or a
+    // pool whose resources the GPU just released keeps growing (SotC PC port PR #46)
+    const auto search = [this, &gpu_tick](std::size_t begin,
                                          std::size_t end) -> std::optional<std::size_t> {
         for (std::size_t iterator = begin; iterator < end; ++iterator) {
             if (gpu_tick >= ticks[iterator]) {

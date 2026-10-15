@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <x86intrin.h>
 #include "common/perf_stats.h"
 #include "common/types.h"
@@ -56,8 +57,13 @@ inline std::array<std::atomic<u64>, NumPaths> path_cycles{};
 inline std::atomic<u64> stream_copies{};
 inline std::atomic<u64> stream_bytes{};
 
+/// PINK_PROF_DRAWREC=1 with the perf stats: the per-draw clock costs 15-25% of the frame rate in
+/// heavy areas, so plain "medir" leaves it off
 inline bool On() {
-    static const bool on = Common::PerfStats::Enabled();
+    static const bool on = [] {
+        const char* v = std::getenv("PINK_PROF_DRAWREC");
+        return Common::PerfStats::Enabled() && v && v[0] == '1';
+    }();
     return on;
 }
 
