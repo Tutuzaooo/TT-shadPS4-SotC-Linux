@@ -89,6 +89,9 @@ public:
     /// Track GPU writes outside packet bindings, such as DMA_DATA and RELEASE_MEM GDS copies, until a flush after the next packet marks
     /// them; stage A only
     void NetPendingWrite(VAddr addr, u64 size);
+    /// Keep recording-thread CPU fence labels and timestamps pending until the next fence packet runs; stage A only, and disabled without
+    /// constant_ring
+    void NetPendingCpuWrite(VAddr addr, u64 size);
 
     /// Work selected by a draw_pipe_steps bit for the recording thread
     enum class PipeStep : u8 {
@@ -564,7 +567,8 @@ private:
         VAddr addr;
         u64 size;
         u64 packet;
-        /// replicate_fill_hle writes on the CPU or flushes its own GPU write within stage B
+        /// Stage B writes this range on the CPU or flushes its marks within the packet, for replicate_fill_hle fills and constant_ring
+        /// fence labels
         bool cpu;
     };
     /// GPU writes finish tracking after a later sync flush marks and protects them; CPU writes finish when their packet runs

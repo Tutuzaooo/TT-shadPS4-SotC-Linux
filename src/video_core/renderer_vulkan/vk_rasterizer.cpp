@@ -971,6 +971,16 @@ void Rasterizer::NetPendingWrite(VAddr addr, u64 size) {
     AddNetRange(addr, memory->ClampRangeSize(addr, size), draw_pipe->NextPacket(), false);
 }
 
+void Rasterizer::NetPendingCpuWrite(VAddr addr, u64 size) {
+    // Track labels only for constant_ring, also making SRT walks wait for the fence; aligned 4- or 8-byte labels stay within their mapping
+    if (!constant_ring || !DrawPipe::OnStageA() || size == 0 || !IsMapped(addr, 1)) {
+        return;
+    }
+    PruneNet();
+    // Use the fence packet RunInOrder commits next
+    AddNetRange(addr, size, draw_pipe->NextPacket(), true);
+}
+
 void Rasterizer::PruneNet() {
     while (!net_pending.empty() && NetRangeDone(net_pending.front())) {
         const auto& front = net_pending.front();
@@ -1032,8 +1042,8 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, u32 stage_index)
         if (size == 0 || size > VideoCore::BufferCache::STREAM_THRESHOLD) {
             continue;
         }
-        // Check pending writes before page marks; a completed flush has marked its pages by the second check, while reversing the checks
-        // could miss a concurrent flush
+        // Check pending buffer, DMA_DATA, GDS, fill and fence-label writes before page marks; completed flushes publish marks before the
+        // second check, avoiding a race with a concurrent flush
         if (std::ranges::any_of(net_pending, [&](const NetRange& range) {
                 return addr < range.addr + range.size && range.addr < addr + size &&
                        !NetRangeDone(range);

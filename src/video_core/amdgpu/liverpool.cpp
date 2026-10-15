@@ -242,21 +242,25 @@ static void WriteLabel(void* address, u64 data, u32 num_bytes, u64 queue, bool l
                 fmt::ptr(address));
 }
 
-/// RELEASE_MEM writes directly, so drop recording-thread writes to guest labels unmapped since decode; UnmapMemory waits for published
-/// packets, leaving only a guest race here
-static bool ReleaseMemLabelUnmapped(const PM4CmdReleaseMem& packet) {
-    u64 num_bytes;
-    switch (packet.data_sel.Value()) {
+/// CPU byte count for an EOP or RELEASE_MEM label; 0 for no CPU write, including GdsMemStore GPU copies
+static u32 LabelBytes(DataSelect data_sel) {
+    switch (data_sel) {
     case DataSelect::Data32Low:
-        num_bytes = sizeof(u32);
-        break;
+        return sizeof(u32);
     case DataSelect::Data64:
     case DataSelect::GpuClock64:
     case DataSelect::PerfCounter:
-        num_bytes = sizeof(u64);
-        break;
+        return sizeof(u64);
     default:
-        // GdsMemStore copies on the GPU
+        return 0;
+    }
+}
+
+/// RELEASE_MEM writes directly, so drop recording-thread writes to guest labels unmapped since decode; UnmapMemory waits for published
+/// packets, leaving only a guest race here
+static bool ReleaseMemLabelUnmapped(const PM4CmdReleaseMem& packet) {
+    const u32 num_bytes = LabelBytes(packet.data_sel.Value());
+    if (num_bytes == 0) {
         return false;
     }
     const auto address = packet.Address<VAddr>();
@@ -1184,11 +1188,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (event_eos->command == PM4CmdEventWriteEos::Command::SignalFence) {
                     const PM4CmdEventWriteEos packet = *event_eos;
                     const auto label_addr = event_eos->Address<VAddr>();
-                    // Let CP waits see the pending label until the recording thread writes it
-                    const u64 seq = pipe_task
-                                        ? DelayedLabels::AddPending(label_addr, packet.DataDWord(),
-                                                                    sizeof(u32), true)
-                                        : 0;
+                    // Let CP waits see the pending label and keep constant_ring from copying it before the recording thread writes it
+                    u64 seq = 0;
+                    if (pipe_task) {
+                        seq = DelayedLabels::AddPending(label_addr, packet.DataDWord(), sizeof(u32),
+                                                        true);
+                        rasterizer->NetPendingCpuWrite(label_addr, sizeof(u32));
+                    }
                     const auto fence = [this, packet, label_addr, seq, pipe_task] {
                         if (rasterizer) {
                             rasterizer->OnFence();
@@ -1255,6 +1261,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     ? DelayedLabels::AddPendingData(label_addr, data_sel,
                                                                     packet.DataQWord(), pipe_task)
                                     : 0;
+                // Exclude pending recording-thread labels from constant_ring; timer-delayed labels are outside packet order and race
+                // decode-time copies just as they do in the serial path
+                if (pipe_task && delay_us == 0) {
+                    rasterizer->NetPendingCpuWrite(label_addr, LabelBytes(data_sel));
+                }
                 const auto fence = [this, packet, signal_irq, label_addr, delay_us, seq,
                                     pipe_task] {
                     if (rasterizer) {
@@ -1866,6 +1877,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (data_sel == DataSelect::GdsMemStore) {
                     // Track this recording-thread GPU copy outside packet bindings
                     rasterizer->NetPendingWrite(label_addr, u64{packet.num_dw} * sizeof(u32));
+                } else {
+                    // Track this CPU label write so constant_ring cannot copy the old value
+                    rasterizer->NetPendingCpuWrite(label_addr, LabelBytes(data_sel));
                 }
             }
             const auto fence = [this, packet, pipe_id = queue.pipe_id, label_addr, seq, pipe_task] {
