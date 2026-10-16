@@ -6,6 +6,9 @@ A Linux build of [Pink-shadPS4](https://github.com/luizgustavs/Pink-shadPS4) tun
 Tested on CachyOS (kernel 7.2), KDE Wayland, RTX 5060 8 GB, i5-12400F, 1440p:
 heavy areas went from 18–26 fps to around 30 fps or more; light and medium areas reach 50–60 fps.
 
+The full story of how this build came together (what we built, what we borrowed, results):
+**[STORY.md](STORY.md)**.
+
 ## Quick start
 
 ```bash
