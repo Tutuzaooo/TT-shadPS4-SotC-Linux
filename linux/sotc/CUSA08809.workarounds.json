@@ -1,0 +1,51 @@
+{
+  "General": {
+    "extra_dmem_in_mbytes": 512,
+    "redirect_app0_logs": true,
+    "poll_connected_pads_only": true
+  },
+  "Log": {
+    "filter": "*:Warning Render.Vulkan:Warning Tty:Info"
+  },
+  "Vulkan": {
+    "pipeline_cache_enabled": true
+  },
+  "GPU": {
+    "compute_loop_cap": 1048576,
+    "preserve_split_protection": true,
+    "cpu_authoritative_stacks": true,
+    "bpe_heap_guard_address": 13713341728,
+    "fsr_enabled": true,
+    "rcas_attenuation": 522,
+    "rcas_enabled": true,
+    "lds_barrier_uniform_readlane": true,
+    "early_fragment_tests_from_z_order": true,
+    "lod_stats_from_bindings": true,
+    "dynamic_tsharp_array_size": 16,
+    "wave64_uniform_branches": true,
+    "wave64_missing_lane_identity": true,
+    "lds_barriers_large_groups": true,
+    "srt_walker_clean_reads": true,
+    "shader_code_clean_reads": true,
+    "readback_ahead": true,
+    "periodic_flush_commands": 256,
+    "readback_ahead_transfer_queue": true,
+    "wait_spin_us": 200,
+    "dma_sweep_skip_stacks": true,
+    "gpu_overhead_cuts": true,
+    "cp_recording_cuts": true,
+    "mapped_page_table": true,
+    "dma_sync_once_per_batch": true,
+    "incremental_bind": true,
+    "tsharp_cache": true,
+    "wait_marker": 2,
+    "image_memory_pool": true,
+    "cp_record_thread": true,
+    "eop_label_delay_us": 500,
+    "direct_memory_access_enabled": false,
+    "readbacks_mode": 2,
+    "readback_hot_regions": true,
+    "access_bitmap_tracking": true,
+    "page_spin_locks": true
+  }
+}

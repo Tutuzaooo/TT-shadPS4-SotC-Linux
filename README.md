@@ -1,3 +1,7 @@
+> **TT-shadPS4 SotC Linux:** this fork is a Linux build of Pink-shadPS4 tuned for Shadow of the
+> Colossus. Build, play and credits: **[linux/README.md](linux/README.md)**. The original
+> Pink-shadPS4 README follows.
+
 # Pink-shadPS4
 
 A fork of shadPS4 focused on fixes specific to Shadow of the Colossus, including experimental fixes and improvements. Some changes may help other games or cause regressions.

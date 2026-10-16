@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=TT-shadPS4 SotC Linux
+Comment=shadPS4 (Pink-shadPS4 fork) tuned for Shadow of the Colossus
+Exec=AppRun
+Icon=sotc-shadps4
+Categories=Game;Emulator;
+Terminal=false
