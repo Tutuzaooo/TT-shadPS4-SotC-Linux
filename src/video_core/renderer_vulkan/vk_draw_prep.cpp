@@ -141,7 +141,7 @@ void RegStateHash::Full(const Regs& regs) {
     valid = true;
 }
 
-void RegStateHash::Update(const Regs& regs, const std::bitset<RegDirty::NumBlocks>& dirty) {
+void RegStateHash::Update(const Regs& regs, const Common::BlockBits<RegDirty::NumBlocks>& dirty) {
     for (size_t block = dirty._Find_first(); block < dirty.size();
          block = dirty._Find_next(block)) {
         value ^= blocks[block];

@@ -536,7 +536,7 @@ private:
     std::chrono::steady_clock::time_point pipe_stats_time{};
     // Draw preparation: the register state hash, and the blocks written since it was updated
     RegStateHash state_hash;
-    std::bitset<AmdGpu::RegDirty::NumBlocks> hash_pending;
+    Common::BlockBits<AmdGpu::RegDirty::NumBlocks> hash_pending;
     bool hash_reset_pending{};
     // Pending writes (stage A): the guest buffers that packets queued for stage B write, kept
     // until stage B has run them. Before stage A reads guest memory through a clean read (shader

@@ -55,7 +55,7 @@ struct RegStateHash {
 
     void Full(const AmdGpu::Regs& regs);
     void Update(const AmdGpu::Regs& regs,
-                const std::bitset<AmdGpu::RegDirty::NumBlocks>& dirty);
+                const Common::BlockBits<AmdGpu::RegDirty::NumBlocks>& dirty);
 };
 
 struct PreparedStage {

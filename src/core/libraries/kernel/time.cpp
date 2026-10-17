@@ -501,6 +501,20 @@ s32 PS4_SYSV_ABI sceKernelConvertUtcToLocaltime(time_t time, time_t* local_time,
         *dst_sec = res == TIME_ZONE_ID_DAYLIGHT ? -_dstbias : 0;
     }
 #else
+#if defined(_LIBCPP_VERSION) && !defined(__APPLE__) && !defined(__FreeBSD__)
+    // libc++ on Linux has no time zone database: same fields from the C library
+    struct {
+        std::chrono::seconds offset;
+        std::chrono::minutes save;
+    } info{};
+    {
+        const time_t now = ::time(nullptr);
+        struct tm lt {};
+        localtime_r(&now, &lt);
+        info.offset = std::chrono::seconds{lt.tm_gmtoff};
+        info.save = std::chrono::minutes{lt.tm_isdst > 0 ? 60 : 0};
+    }
+#else
 #if defined(__APPLE__) || defined(__FreeBSD__)
     // std::chrono::current_zone() not available yet.
     const auto* time_zone = date::current_zone();
@@ -508,6 +522,7 @@ s32 PS4_SYSV_ABI sceKernelConvertUtcToLocaltime(time_t time, time_t* local_time,
     const auto* time_zone = std::chrono::current_zone();
 #endif // __APPLE__
     auto info = time_zone->get_info(std::chrono::system_clock::now());
+#endif
 
     *local_time = info.offset.count() + info.save.count() * 60 + time;
 

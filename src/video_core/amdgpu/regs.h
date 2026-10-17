@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "common/block_bits.h"
+
 #include <algorithm>
 #include <bitset>
 #include <cstring>
@@ -199,7 +201,7 @@ union Regs {
 struct RegDirty {
     static constexpr u32 BlockWords = 32;
     static constexpr u32 NumBlocks = Regs::NumRegs / BlockWords;
-    std::bitset<NumBlocks> blocks;
+    Common::BlockBits<NumBlocks> blocks;
     bool reset = false; ///< SetDefaults ran: defaults first, then the marked blocks
 
     void Mark(u32 word, u32 count) {
