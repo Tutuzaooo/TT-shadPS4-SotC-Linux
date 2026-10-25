@@ -32,6 +32,10 @@ struct ResourceDiscovery {
 };
 using ResourceDiscoveryList = boost::container::small_vector<ResourceDiscovery, 32>;
 
+/// For dynamic_tsharp_array_size, find the flat SharpLocation of n when `element` counts through a T# table in `for (i = 0; i < n; ++i)`;
+/// return UNKNOWN_LOCATION otherwise
+u16 FindLoopCountLocation(const IR::Value& element);
+
 inline bool IsBufferAtomic(const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::BufferAtomicIAdd32:

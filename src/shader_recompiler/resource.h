@@ -64,10 +64,9 @@ struct SharpFetch {
     }
 };
 
-/// Per-game dynamic_tsharp_array_size: a table of sharps in guest memory that the shader indexes at runtime,
-/// ReadConst(ptr, element * stride_dw + offset_dw + k). Every flat buffer refresh copies num_elements *
-/// stride_dw dwords from ptr + offset_dw * 4 to flatbuf_off, where element i starts at flatbuf_off + i *
-/// stride_dw
+/// dynamic_tsharp_array_size describes a guest T# table indexed as ReadConst(ptr, element * stride_dw + offset_dw + k); refreshes copy
+/// num_elements * stride_dw dwords from ptr + offset_dw * 4 to flatbuf_off; count_loc holds a flattened loop bound, and entries from that
+/// bound onward bind null; graphics tables without a bound stay null
 struct SharpTable {
     SharpLocation ptr_lo;
     SharpLocation ptr_hi;
@@ -75,6 +74,7 @@ struct SharpTable {
     u16 num_elements;
     u32 offset_dw;
     u32 stride_dw;
+    SharpLocation count_loc; // UNKNOWN_LOCATION means no loop bound; every element may be read
 
     u32 NumDwords() const noexcept {
         return num_elements * stride_dw;
@@ -259,7 +259,10 @@ struct FMaskResource {
     SharpLocation sharp_idx;
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
-        return info.template ReadUdSharp<AmdGpu::Image>(sharp_idx);
+        // Table-element T#s have no flat buffer location
+        return sharp_idx == UNKNOWN_LOCATION
+                   ? AmdGpu::Image::Null(false)
+                   : info.template ReadUdSharp<AmdGpu::Image>(sharp_idx);
     }
 };
 using FMaskResourceList = boost::container::static_vector<FMaskResource, NUM_FMASKS>;

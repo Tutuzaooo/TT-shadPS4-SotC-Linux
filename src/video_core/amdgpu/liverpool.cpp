@@ -553,7 +553,11 @@ void Liverpool::RunEventWriteEos(const PM4CmdEventWriteEos* event_eos) {
         Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
                                           reinterpret_cast<u64>(address), num_bytes,
                                           &data, 0);
-        ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+        // Labels written from the draw pipe may find the guest already unmapped them (Pink 0.5.0
+        // WriteLabel): drop the write instead of aborting
+        if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+            LOG_WARNING(Render, "Label {} unmapped before its write, dropped", fmt::ptr(address));
+        }
     });
     if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
         ASSERT(event_eos->size == 1);
@@ -630,7 +634,11 @@ void Liverpool::RunEventWriteEop(const PM4CmdEventWriteEop* event_eop) {
         Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
                                           reinterpret_cast<u64>(address), num_bytes,
                                           &data, 1);
-        ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+        // Labels written from the draw pipe may find the guest already unmapped them (Pink 0.5.0
+        // WriteLabel): drop the write instead of aborting
+        if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+            LOG_WARNING(Render, "Label {} unmapped before its write, dropped", fmt::ptr(address));
+        }
     };
     const auto signal_irq = [] {
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);

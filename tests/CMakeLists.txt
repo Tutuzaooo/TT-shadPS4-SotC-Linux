@@ -103,6 +103,7 @@ set(GCN_TEST_SOURCES
     common/test_dom_interval_list.cpp
     common/test_lru_cache.cpp
     common/test_recursive_lock.cpp
+    common/test_slot_vector.cpp
     core/test_stack_ranges.cpp
     gcn/test_buffer_format_lowering.cpp
     gcn/test_component_swizzle.cpp

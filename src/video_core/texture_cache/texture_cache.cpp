@@ -584,6 +584,14 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
+namespace {
+thread_local bool last_find_exact = false;
+} // Anonymous namespace
+
+bool TextureCache::LastFindExact() noexcept {
+    return last_find_exact;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     Vulkan::DrawPipe::CheckOwner("TextureCache::FindImage");
     const auto& info = desc.info;
@@ -617,6 +625,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
         image_id = cache_id;
     }
+    last_find_exact = static_cast<bool>(image_id);
 
     // Try to resolve overlaps (if any)
     int view_mip{-1};
@@ -642,10 +651,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
+            last_find_exact = false;
         } else if (image_resolved.info.resources < info.resources) {
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
+            last_find_exact = false;
             LOG_RENDER_PROBLEM(Render_Vulkan, Warning, "Image overlap resolve failed");
         }
     }
@@ -672,6 +683,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 }
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
+    // Hold the lock while walking because Picked shares flags with guest write faults' CpuDirty bit, and guest threads also change the page
+    // table
+    std::scoped_lock lock{mutex};
     ImageIds image_ids;
     ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
         if (ensure_valid && !image.SafeToDownload()) {
@@ -724,14 +738,20 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
-        surface_metas.emplace(desc.info.meta_info.cmask_addr,
-                              MetaDataInfo{.type = MetaType::CMask});
+        if (surface_metas
+                .emplace(desc.info.meta_info.cmask_addr, MetaDataInfo{.type = MetaType::CMask})
+                .second) {
+            meta_generation.fetch_add(1, std::memory_order_relaxed);
+        }
         image.info.meta_info.cmask_addr = desc.info.meta_info.cmask_addr;
     }
 
     if (desc.info.meta_info.fmask_addr) {
-        surface_metas.emplace(desc.info.meta_info.fmask_addr,
-                              MetaDataInfo{.type = MetaType::FMask});
+        if (surface_metas
+                .emplace(desc.info.meta_info.fmask_addr, MetaDataInfo{.type = MetaType::FMask})
+                .second) {
+            meta_generation.fetch_add(1, std::memory_order_relaxed);
+        }
         image.info.meta_info.fmask_addr = desc.info.meta_info.fmask_addr;
     }
 
@@ -746,14 +766,20 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
-        surface_metas.emplace(desc.info.meta_info.htile_addr,
-                              MetaDataInfo{.type = MetaType::HTile,
-                                           .clear_mask = image.info.meta_info.htile_clear_mask});
+        if (surface_metas
+                .emplace(desc.info.meta_info.htile_addr,
+                         MetaDataInfo{.type = MetaType::HTile,
+                                      .clear_mask = image.info.meta_info.htile_clear_mask})
+                .second) {
+            meta_generation.fetch_add(1, std::memory_order_relaxed);
+        }
         image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
     }
 
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
+        // Hold the lock against guest registration, write faults and unmaps that change the page table, LRU and Picked flags
+        std::scoped_lock lock{mutex};
         ImageId stencil_id{};
         ForEachImageInRegion(
             desc.info.stencil_addr, desc.info.stencil_size, [&](ImageId image_id, Image& image) {
@@ -1492,8 +1518,6 @@ void TextureCache::UpdateTarget(ImageId image_id) {
         }
     }
     std::scoped_lock lk{mutex};
-    // Fetch the image again under the lock
-    // Guest video buffer registration can grow slot_images while this thread waits
     Image& locked = slot_images[image_id];
     TrackImage(image_id);
     TouchImage(locked);
@@ -1513,6 +1537,21 @@ void TextureCache::TouchReusedImage(ImageId image_id) {
     }
 }
 
+void TextureCache::TouchReusedTarget(ImageId image_id, const ImageDesc& desc) {
+    Image& image = slot_images[image_id];
+    image.flags |= ImageFlagBits::GpuModified;
+    if (desc.type == BindingType::DepthTarget) {
+        image.usage.depth_target = 1u;
+    } else {
+        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+            std::unique_lock lk{download_images_mutex};
+            download_images.emplace(image_id);
+        }
+        image.usage.render_target = 1u;
+    }
+    UpdateTarget(image_id);
+}
+
 void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
@@ -1522,12 +1561,15 @@ void TextureCache::DeleteImage(ImageId image_id) {
     const auto& meta_info = image.info.meta_info;
     if (meta_info.cmask_addr) {
         surface_metas.erase(meta_info.cmask_addr);
+        meta_generation.fetch_add(1, std::memory_order_relaxed);
     }
     if (meta_info.fmask_addr) {
         surface_metas.erase(meta_info.fmask_addr);
+        meta_generation.fetch_add(1, std::memory_order_relaxed);
     }
     if (meta_info.htile_addr) {
         surface_metas.erase(meta_info.htile_addr);
+        meta_generation.fetch_add(1, std::memory_order_relaxed);
     }
 
     {

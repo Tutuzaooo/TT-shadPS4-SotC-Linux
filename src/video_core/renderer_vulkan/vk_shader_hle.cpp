@@ -196,10 +196,11 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     const auto ctl = info.buffers[0].GetSharp(info);
     const auto src = info.buffers[1].GetSharp(info);
     const auto dst = info.buffers[2].GetSharp(info);
-    const u32 src_stride = src.GetStride() ? src.GetStride() : 4;
-    const u32 dst_stride = dst.GetStride() ? dst.GetStride() : 4;
-    if (src_stride != 4 || dst_stride != 4 || ctl.GetSize() < 8 || ctl.base_address <= 1 ||
-        src.base_address <= 1 || dst.base_address <= 1) {
+    // Match idxen addressing (Pink 0.5.0 192ec8e): stride 0 makes every thread use element 0,
+    // and swizzled V#s reorder elements, so both stay on the GPU
+    if (src.GetStride() != 4 || dst.GetStride() != 4 || src.swizzle_enable || dst.swizzle_enable ||
+        ctl.GetSize() < 8 || ctl.base_address <= 1 || src.base_address <= 1 ||
+        dst.base_address <= 1) {
         return fallback(0);
     }
     if (buffer_cache.IsRegionGpuModified(ctl.base_address, 8)) {

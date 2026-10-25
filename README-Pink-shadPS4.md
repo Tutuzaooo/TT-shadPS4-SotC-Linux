@@ -94,7 +94,59 @@ These defaults are from the emulator; per-game presets may override them.
 | `image_memory_pool` | `false` | Sub-allocates images up to 16 MB from pools with 32 MB blocks instead of allocating memory separately for each image. |
 | `cp_record_thread` | `false` | Moves Vulkan command recording and submissions to a separate worker thread; pairs with `readback_ahead_transfer_queue`. |
 | `lds_barriers_large_groups` | `true` | Adds shared-memory barriers to compute workgroups larger than 64 threads to fix the blown-out sun on NVIDIA. |
-| `eop_label_delay_us` | `0` | Temporary workaround for SotC's flickering rocks: delays graphics EOP labels by a fixed number of microseconds (`2000` was used in testing); `0` disables it. This does not guarantee GPU completion, and enabling `readback_ahead` can bring the flicker back. |
+| `eop_label_delay_us` | `0` | Temporary workaround for SotC's flickering rocks: delays graphics EOP labels by a fixed number of microseconds (`2000` was used in testing); `0` disables it. This does not guarantee GPU completion, and enabling `readback_ahead` can bring the flicker back. With `draw_pipe_steps` set to `2`, the delay starts when the draw recording thread reaches the label instead of when the command is read, so labels reach the game later, never earlier. |
+
+#### GPU keys added in 0.4.0
+
+These defaults are from the emulator; per-game presets may override them.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `relative_instance_id` | `false` | Starts shader instance IDs at zero for each draw. May fix misplaced geometry and effects. |
+| `gcn_nan_semantics` | `false` | Matches console handling of invalid floating-point values. May fix fog and lighting artifacts. |
+| `legacy_mad_semantics` | `false` | Matches console behavior for legacy multiply-add calculations. Use with `gcn_nan_semantics`. |
+| `force_anisotropy` | `0` | Raises anisotropic filtering for eligible textures to improve clarity at an angle, with more GPU work. Accepts `2`, `4`, `8` or `16`; `0` keeps the game's filtering. |
+| `readback_hot_regions` | `false` | Downloads recently requested GPU memory regions together. May reduce repeated waits, but can transfer more data. |
+| `depth_target_sampled_layout` | `false` | Reuses the same image layout when sampling a read-only depth target. May reduce synchronization overhead, but can cause occasional visual glitches. |
+| `gcn_unordered_dispatches` | `false` | Lets compute tasks overlap when the game does not request synchronization. May improve GPU performance, but can cause occasional visual glitches. |
+| `access_bitmap_tracking` | `false` | Uses compact maps to track buffer access. May reduce CPU work while preserving synchronization. |
+| `page_spin_locks` | `false` | Uses lightweight locks for GPU memory tracking. May reduce CPU overhead; applies when the game starts. |
+| `range_fast_paths` | `false` | Skips redundant buffer tracking and synchronization checks. May reduce CPU work. |
+| `unbounded_vsharp_cap_mb` | `0` | Limits VRAM allocated to read-only buffers with no declared size. May reduce VRAM use, but can cause unstable geometry or missing objects; `0` disables it. |
+| `texture_gc_full_scan` | `false` | Improves cleanup of unused textures. May reduce VRAM use, but textures must be reloaded if needed again. |
+| `texture_gc_trigger_mb` | `0` | Sets the VRAM usage threshold in MB for cleaning up unused textures. Lower values increase texture reloads; `0` selects the threshold automatically. |
+| `image_pool_texture_max_kb` | `0` | Allocates textures above this size in KB separately from the image pool. May reduce retained VRAM, but can cause loading stutter. Requires `image_memory_pool`; `0` disables it. |
+| `arena_evict_idle_s` | `0` | Releases unused buffer memory after this many seconds, preserving GPU-written data. May reduce VRAM use, but reloading can cause stutter or visual issues; `0` disables it. |
+
+Changing `relative_instance_id`, `gcn_nan_semantics` or `legacy_mad_semantics` recompiles shaders and may cause temporary stuttering.
+
+#### GPU keys added in 0.5.0
+
+These defaults are from the emulator; per-game presets may override them.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `render_state_memo` | `false` | Reuses the render targets of the previous draw while their settings and memory are unchanged. May reduce CPU work, but can draw to the wrong target or flash when the scene switches passes. |
+| `draw_pipe` | `false` | Records draws and dispatches on a second thread while the command processor reads the next commands. May improve the frame rate when the CPU is the limit, but can cause freezes, crashes or device loss. Requires `readbacks_mode` `2`. |
+| `draw_pipe_steps` | `0` | With `draw_pipe`, `2` also writes the fence labels the game waits on from the draw recording thread, in order with the draws, instead of waiting for that thread to catch up first. May improve the frame rate, but can bring back flickering. Only `2` is supported; other bits are ignored, and `0` disables it. |
+| `constant_ring` | `false` | Copies small read-only buffers into a separate 128 MB ring before draws are handed to the draw recording thread, which then only binds them. May improve the frame rate, but uses 128 MB more memory and can cause wrong geometry. Requires `draw_pipe`. |
+| `replicate_fill_hle` | `false` | Shadow of the Colossus only: runs the compute shader that fills its resource tables on the CPU, in command order, instead of on the GPU. May reduce GPU waits, but can cause swapped textures or missing objects. Works with or without `draw_pipe`. |
+
+`draw_pipe` is ignored unless `readbacks_mode` is precise (`2`, as in the SotC preset). On Linux it is also ignored when `userfaultfd` memory tracking is enabled. While the `draw_pipe` key is on, `srt_walker_clean_reads` and `readback_ahead` stay off for that run; the saved settings do not change. `draw_pipe_steps` and `constant_ring` do nothing unless `draw_pipe` is active. `shadps4.log` shows `Workaround draw_pipe enabled` or the reason it was ignored.
+
+Turning `draw_pipe` on or off recompiles shaders once and may cause temporary stuttering (not when `srt_walker_clean_reads` is enabled).
+
+#### Which 0.5.0 key to turn off first
+
+If a problem appears with the 0.5.0 keys enabled, turn off the key for that symptom first and test again.
+
+| Symptom | Turn off first |
+| --- | --- |
+| Swapped textures, missing objects, wrong materials or a crash right after a loading screen | `replicate_fill_hle` |
+| Flickering rocks or other objects that flicker between frames | Set `draw_pipe_steps` to `0`, then turn off `draw_pipe` |
+| Shadows, reflections, post-processing or HUD drawn wrong, or a flash on menu changes and camera cuts | `render_state_memo` |
+| Broken geometry or wrong shader values, such as misplaced vertices or wrong lighting | `constant_ring` |
+| Other freezes, crashes or device loss with `draw_pipe` on | `draw_pipe` (this also disables `draw_pipe_steps` and `constant_ring`) |
 
 ### Other settings used by the SotC presets
 
@@ -109,7 +161,42 @@ These are regular emulator settings stored alongside the workarounds in the ship
 | `pipeline_cache_enabled` | Reuses cached Vulkan pipelines to reduce shader compilation stutter. |
 | `windows_guest_red_zone_protection_mode` | Selects the Windows guest red-zone protection strategy. |
 
+### PS4 Pro rendering added in 0.4.0
+
+Available in the game's **General > PS4 Pro** settings in the launcher.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `sotc_pro_4k` | `false` | Enables higher-resolution PS4 Pro rendering in SotC. Requires `neo_mode` and automatically increases game memory. Improves image detail, but uses more GPU and memory and may worsen flickering. |
+
+### DLSS Neural Rendering added in 0.4.0
+
+Requires Windows, an NVIDIA RTX GPU and `nvngx_dlssnr.dll` next to `shadps4.exe`. These GPU settings are not exposed in the launcher; press **F1** to toggle the effect in game. HDR is not supported.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `dlss_nr_enabled` | `false` | Applies Neural Rendering to the final frame. May improve image detail, but adds GPU work. |
+| `dlss_nr_style` | `0` | Selects the image style: `0` Default, `1` Natural or `2` Cinematic. |
+| `dlss_nr_intensity` | `1.0` | Sets the detail strength from `0` to `2`. Higher values apply a stronger effect. |
+| `dlss_nr_ui_correction` | `true` | Enables HUD correction to help preserve the game's interface. |
+
+The input key `hotkey_toggle_dlss_nr` selects the toggle shortcut; its default is `f1`.
+
+### Console logging added in 0.4.0
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `console_mode` (Log) | `events` | Shows crash, shader and rendering problems in the console. Use `all` to mirror the full log; the log file keeps all recorded messages in either mode. |
+
 ### Shader cache
+
+The first boot of 0.5.0 recompiles the shaders once because the cache format changed (shader metadata
+version 11), so expect stuttering until the cache is rebuilt. The old cache does not need to be deleted for
+this.
+
+Since 0.5.0, other games may show more `BROKEN SHADER` events in the console. These shaders already drew
+with a missing resource, so the image does not change, and the events are no reason to enable
+`direct_memory_access_enabled`.
 
 If a game shows a burst of rejected textures, thousands of new shader permutations or a device loss right
 after boot, the shader cache may have been corrupted by an older build (a new permutation could overwrite

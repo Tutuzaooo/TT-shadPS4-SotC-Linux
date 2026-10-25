@@ -232,7 +232,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
         }
     }
 
-    return true;
+    // Stop at an unbacked VMA and report success only if every byte was written
+    return size == 0;
 }
 
 bool MemoryManager::TryReadBacking(VAddr virtual_addr, void* out, u64 size) {
