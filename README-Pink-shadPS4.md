@@ -5,9 +5,9 @@ The focus is Windows with NVIDIA graphics cards. I do not have the means to test
 
 # DOWNLOAD
 
-[![Download latest release](https://img.shields.io/badge/Download-Latest%20Release-pink?style=for-the-badge)](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.4.0/Pink-shardPS4.0.4.0.zip)
+[![Download latest release](https://img.shields.io/badge/Download-Latest%20Release-pink?style=for-the-badge)](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.5.0/Pink-shardPS4.0.5.0.zip)
 
-[Download Pink-shardPS4 0.4.0 ZIP](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.4.0/Pink-shardPS4.0.4.0.zip)
+[Download Pink-shardPS4 0.5.0 ZIP](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.5.0/Pink-shardPS4.0.5.0.zip)
 
 The ZIP already includes the launcher and emulator with specific settings for the game. Use the launcher included in this version; other launchers won't enable the required workarounds.
 
@@ -22,8 +22,7 @@ The ZIP already includes the launcher and emulator with specific settings for th
 
 #### NVIDIA and AMD
 
-- **Workarounds > Command recording cuts:** turn this on for some extra FPS. It may cause occasional hiccups or rare graphical glitches, so turn it off for a more stable experience.
-- **General > Additional DMMem allocation:** `512 MB` may help. If your system is memory-constrained, leave it at `0`.
+- **General > Additional DMMem allocation:** `0` by default. `256 MB` may help if your system has memory to spare.
 
 #### Additional AMD settings
 
@@ -36,11 +35,14 @@ AMD users may get a better experience with the following workaround settings:
 
 ## Known issues
 
-1. Many issues remain; this fork is still experimental.
-2. VRAM usage is very high. It is unclear whether playing with less than 12 GB of VRAM is viable.
-3. Some textures occasionally fail to load. Restarting the game usually fixes this.
-4. Stability on AMD graphics cards is currently uncertain.
-5. Some level-of-detail (LOD) issues remain.
+The [0.5.0 release](https://github.com/luizgustavs/Pink-shadPS4/releases/tag/0.5.0) prioritizes performance, but has more graphical problems and is less stable overall than 0.4.0. If 0.4.0 already performs well on your system, consider staying on that version.
+
+1. Flickering can occur more often than in previous versions.
+2. Some textures occasionally fail to load. Restarting the game usually fixes this.
+3. This release has not been tested on AMD graphics cards.
+4. Some level-of-detail (LOD) issues remain.
+
+VRAM usage has been reduced in 0.5.0 to better accommodate 8 GB graphics cards.
 
 ## Technical stuff (Workaround keys)
 
@@ -122,15 +124,15 @@ Changing `relative_instance_id`, `gcn_nan_semantics` or `legacy_mad_semantics` r
 
 #### GPU keys added in 0.5.0
 
-These defaults are from the emulator; per-game presets may override them.
+The table lists emulator defaults and the values applied by the shipped SotC presets (version 5). `render_state_memo` stays off in those presets because it showed no measurable gain in SotC.
 
-| Key | Default | Description |
-| --- | --- | --- |
-| `render_state_memo` | `false` | Reuses the render targets of the previous draw while their settings and memory are unchanged. May reduce CPU work, but can draw to the wrong target or flash when the scene switches passes. |
-| `draw_pipe` | `false` | Records draws and dispatches on a second thread while the command processor reads the next commands. May improve the frame rate when the CPU is the limit, but can cause freezes, crashes or device loss. Requires `readbacks_mode` `2`. |
-| `draw_pipe_steps` | `0` | With `draw_pipe`, `2` also writes the fence labels the game waits on from the draw recording thread, in order with the draws, instead of waiting for that thread to catch up first. May improve the frame rate, but can bring back flickering. Only `2` is supported; other bits are ignored, and `0` disables it. |
-| `constant_ring` | `false` | Copies small read-only buffers into a separate 128 MB ring before draws are handed to the draw recording thread, which then only binds them. May improve the frame rate, but uses 128 MB more memory and can cause wrong geometry. Requires `draw_pipe`. |
-| `replicate_fill_hle` | `false` | Shadow of the Colossus only: runs the compute shader that fills its resource tables on the CPU, in command order, instead of on the GPU. May reduce GPU waits, but can cause swapped textures or missing objects. Works with or without `draw_pipe`. |
+| Key | Default | SotC preset | Description |
+| --- | --- | --- | --- |
+| `render_state_memo` | `false` | `false` | Reuses the render targets of the previous draw while their settings and memory are unchanged. May reduce CPU work, but can draw to the wrong target or flash when the scene switches passes. |
+| `draw_pipe` | `false` | `true` | Records draws and dispatches on a second thread while the command processor reads the next commands. May improve the frame rate when the CPU is the limit, but can cause freezes, crashes or device loss. Requires `readbacks_mode` `2`. |
+| `draw_pipe_steps` | `0` | `2` | With `draw_pipe`, `2` also writes the fence labels the game waits on from the draw recording thread, in order with the draws, instead of waiting for that thread to catch up first. May improve the frame rate, but can bring back flickering. Only `2` is supported; other bits are ignored, and `0` disables it. |
+| `constant_ring` | `false` | `true` | Copies small read-only buffers into a separate 128 MB ring before draws are handed to the draw recording thread, which then only binds them. May improve the frame rate, but uses 128 MB more memory and can cause wrong geometry. Requires `draw_pipe`. |
+| `replicate_fill_hle` | `false` | `true` | Shadow of the Colossus only: runs the compute shader that fills its resource tables on the CPU, in command order, instead of on the GPU. May reduce GPU waits, but can cause swapped textures or missing objects. Works with or without `draw_pipe`. |
 
 `draw_pipe` is ignored unless `readbacks_mode` is precise (`2`, as in the SotC preset). On Linux it is also ignored when `userfaultfd` memory tracking is enabled. While the `draw_pipe` key is on, `srt_walker_clean_reads` and `readback_ahead` stay off for that run; the saved settings do not change. `draw_pipe_steps` and `constant_ring` do nothing unless `draw_pipe` is active. `shadps4.log` shows `Workaround draw_pipe enabled` or the reason it was ignored.
 
@@ -154,7 +156,6 @@ These are regular emulator settings stored alongside the workarounds in the ship
 
 | Key | Description |
 | --- | --- |
-| `extra_dmem_in_mbytes` | Adds direct memory for games that need a larger allocation pool. |
 | `filter` | Selects which log categories and severity levels are recorded. |
 | `direct_memory_access_enabled` | Allows direct access to guest memory from the GPU path. |
 | `readbacks_mode` | Selects the GPU readback accuracy mode; the SotC preset uses precise mode (`2`). |
