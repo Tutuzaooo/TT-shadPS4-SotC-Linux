@@ -353,8 +353,6 @@ struct PassInfo {
     // Shared clean-load stub for the current walker
     Xbyak::Label clean_load_stub;
     bool uses_clean_load_stub = false;
-    // Runtime offsets stay in the shader; see IsRuntimeOffset
-    u32 runtime_offset_reads = 0;
 
     PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
         auto it = pointer_uses.find(inst);
@@ -767,41 +765,6 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
     }
 }
 
-/// Detect offsets that depend on a loop counter or a per-lane pointer, including reads through those offsets; the walker runs once before
-/// dispatch, so data reads keep flat offset 0 and use DMA through read_const_dynamic; CollectShaderInfoPass reports an error without DMA,
-/// while sharp reads bind null and are reported by ConstructSharpFetch
-static bool IsRuntimeOffset(const IR::Value& off_dw, u32 depth = 0) {
-    if (off_dw.IsImmediate() || depth == 16) {
-        return false;
-    }
-    const IR::Inst* inst = off_dw.Inst();
-    switch (inst->GetOpcode()) {
-    case IR::Opcode::Phi:
-    case IR::Opcode::ReadFirstLane:
-        return true;
-    case IR::Opcode::GetUserData:
-        return false;
-    case IR::Opcode::ReadConst: {
-        // Leave reads through ReadFirstLane pointers to the shader
-        const IR::Inst* base = inst->Arg(0).TryInst();
-        return (base && base->NumArgs() != 0 && IsRuntimeOffset(base->Arg(0), depth + 1)) ||
-               IsRuntimeOffset(inst->Arg(1), depth + 1);
-    }
-    case IR::Opcode::ReadConstBuffer:
-        return IsRuntimeOffset(inst->Arg(1), depth + 1);
-    default:
-        if (!IsAllowedOffsetInstruction(inst)) {
-            return false;
-        }
-        for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-            if (IsRuntimeOffset(inst->Arg(arg), depth + 1)) {
-                return true;
-            }
-        }
-        return false;
-    }
-}
-
 enum class GuestLoadDst { Rdi, R10d };
 
 /// Loads guest memory at `src` into rdi (8 bytes) or r10d (4 bytes). The address goes to r11 and its page is
@@ -959,10 +922,6 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     for (auto [src_off_dw, use] : *use_list) {
         if (src_off_dw.IsImmediate()) {
             EmitGuestLoad(c, pass_info, GuestLoadDst::R10d, ptr[rdi + (src_off_dw.U32() << 2)]);
-        } else if (IsRuntimeOffset(src_off_dw)) {
-            // Skip this read and its subtree; the shader reads the data through DMA
-            ++pass_info.runtime_offset_reads;
-            continue;
         } else {
             const size_t code_begin = c.getSize();
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
@@ -1032,12 +991,6 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         LOG_CRITICAL(Render_Recompiler, "SRT walker for shader {:#x} does not fit: {}",
                      info.pgm_hash, e.what());
         emitted = false;
-    }
-    if (pass_info.runtime_offset_reads != 0) {
-        // DMA handles data reads only; ConstructSharpFetch reports unflattened sharps as errors
-        LOG_INFO(Render_Recompiler,
-                 "Shader {:#x} reads {} SRT dwords at runtime offsets, left unflattened",
-                 info.pgm_hash, pass_info.runtime_offset_reads);
     }
 
     // A null walker leaves the flattened constants at zero; such a program is never written to the pipeline

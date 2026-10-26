@@ -13,14 +13,19 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-// Binary 6 adds walker recovery, descriptor tolerance for 10_11_11 and add_tid, and DMA bitmap bounds checks and atomics; meta 6 adds the
-// codegen key and uses_loop_cap; meta 7 adds early_fragment_tests, sharp_tables and image array fields; meta 8 changes SharpFetch and
-// FetchShaderData for #5112 and one_vgprs; meta 9 adds clean-page checks for srt_walker_clean_reads; binary 7 limits Flat subgroup inputs
-// to fragment shaders; binary 8 includes ISA fixes #5030, #5031, #5141, #5185, #5186, #5194, #5199, #5200 and #5202; meta 10 adds count_loc
-// and graphics T# arrays; meta 11 replaces unreleased meta 10, uses UNKNOWN_LOCATION for missing bounds and requires a flat loop-header
-// bound for graphics tables
+// ShaderBinaryVersion 6: SRT walkers recover per invocation, 10_11_11 and add_tid tolerate garbage
+// descriptors, DMA fault bitmap uses bounds checks and atomics. ShaderMetaVersion 6: meta records the codegen
+// settings key; Info gains uses_loop_cap. ShaderMetaVersion 7: HwFragmentRuntimeInfo gains
+// early_fragment_tests, InfoPersistent gains sharp_tables and ImageResource the descriptor array fields (all
+// stored raw). ShaderMetaVersion 8: SharpFetch gains summary and FetchShaderData changes layout (#5112,
+// plus one_vgprs). ShaderMetaVersion 9: with srt_walker_clean_reads the SRT walker guest loads test the
+// clean-page bitmap first (the key is in the codegen settings key). ShaderBinaryVersion 7: subgroup built-in
+// inputs are Flat only in fragment shaders (vertex shaders had an invalid Flat)
+// ShaderBinaryVersion 8: upstream ISA fixes (#5030, #5031, #5141, #5185, #5186,
+// #5194, #5199, #5200, #5202)
 static constexpr u32 ShaderBinaryVersion = 8u;
-static constexpr u32 ShaderMetaVersion = 11u;
+// meta 13: v1.1.0 without the 0.5.0 T# array and SRT walker changes (differs from the meta 11 caches of 0.5.0 builds)
+static constexpr u32 ShaderMetaVersion = 13u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 

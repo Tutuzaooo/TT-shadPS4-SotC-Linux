@@ -164,8 +164,6 @@ private:
 
 using SharpSources = boost::container::small_vector<const IR::Inst*, 4>;
 
-/// Return UNKNOWN_LOCATION for dwords outside the flat buffer; reads at runtime offsets stay in the shader and are reported by
-/// ConstructSharpFetch
 SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
     SharpLocation location{};
     if (inst->GetOpcode() == IR::Opcode::GetUserData) {
@@ -181,13 +179,14 @@ SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
         location = inst->Flags<SharpLocation>();
     }
     if (location == 0) {
+        LOG_WARNING(Render_Recompiler, "Sharp source was not flatenned");
         return UNKNOWN_LOCATION;
     }
     return location;
 }
 
 template <typename T>
-SharpFetch<T> ConstructSharpFetch(const Info& info, const SharpReference& sharp) {
+SharpFetch<T> ConstructSharpFetch(const SharpReference& sharp) {
     using Summary = SharpFetch<T>::Summary;
     SharpFetch<T> sharp_fetch{};
     for (u32 i = 0; i < sharp.num_dwords; i++) {
@@ -201,16 +200,6 @@ SharpFetch<T> ConstructSharpFetch(const Info& info, const SharpReference& sharp)
                 sharp_fetch.summary = Summary::Invalid;
             }
         }
-    }
-    if (sharp_fetch.summary == Summary::Invalid) {
-        // Sharps must be resolved on the CPU before binding; DMA handles data only, so an unresolved sharp binds null and reports a broken
-        // shader
-        constexpr std::string_view kind = std::is_same_v<T, AmdGpu::Buffer>  ? "V#"
-                                          : std::is_same_v<T, AmdGpu::Image> ? "T#"
-                                                                             : "S#";
-        LOG_ERROR(Render_Recompiler,
-                  "Shader {:#x} reads a {} the SRT walker could not flatten, bound as null",
-                  info.pgm_hash, kind);
     }
     // An immediate dword has no flat buffer location (its offset stays 0), so it needs the per-dword fetch
     const u32 all_loaded = (1u << sharp.num_dwords) - 1;
@@ -313,70 +302,7 @@ struct SharpTableMatch {
     IR::Value element;
     u32 stride_dw;
     u32 first_dw;
-    SharpLocation count_loc;
 };
-
-/// Find the flat location of n for a loop counter tested at the loop header, or return UNKNOWN_LOCATION; use the header's branch
-/// comparison, not a body guard; n must be user data or a flattened ReadConst, since ReadConstBuffer reads a separate buffer that the GPU
-/// may have changed
-SharpLocation FindLoopCountLocation(const IR::Value& element) {
-    const IR::Inst* phi = element.TryInst();
-    if (!phi || phi->GetOpcode() != IR::Opcode::Phi || phi->NumArgs() != 2) {
-        return UNKNOWN_LOCATION;
-    }
-    bool starts_at_zero = false;
-    bool steps_by_one = false;
-    for (size_t i = 0; i < phi->NumArgs(); ++i) {
-        const IR::Value arg = phi->Arg(i);
-        if (arg.IsImmediate()) {
-            starts_at_zero |= arg.U32() == 0;
-            continue;
-        }
-        const IR::Inst* step = arg.Inst();
-        if (step->GetOpcode() != IR::Opcode::IAdd32) {
-            continue;
-        }
-        for (u32 operand = 0; operand < 2; ++operand) {
-            const IR::Value other = step->Arg(1 - operand);
-            steps_by_one |= step->Arg(operand) == element && other.IsImmediate() && other.U32() == 1;
-        }
-    }
-    if (!starts_at_zero || !steps_by_one) {
-        return UNKNOWN_LOCATION;
-    }
-    // Translate ends conditional blocks with ConditionRef(cmp) or ConditionRef(LogicalNot(cmp)); structurization removes these after this
-    // pass
-    const IR::Inst* cond_ref = phi->GetParent()->branch_cond.TryInst();
-    if (!cond_ref || cond_ref->GetOpcode() != IR::Opcode::ConditionRef) {
-        return UNKNOWN_LOCATION;
-    }
-    const IR::Inst* cmp = cond_ref->Arg(0).TryInst();
-    if (cmp && cmp->GetOpcode() == IR::Opcode::LogicalNot) {
-        cmp = cmp->Arg(0).TryInst();
-    }
-    if (!cmp) {
-        return UNKNOWN_LOCATION;
-    }
-    IR::Value bound;
-    switch (cmp->GetOpcode()) {
-    case IR::Opcode::SLessThan32:
-    case IR::Opcode::ULessThan32:
-        bound = cmp->Arg(0) == element ? cmp->Arg(1) : IR::Value{};
-        break;
-    case IR::Opcode::SGreaterThan32:
-    case IR::Opcode::UGreaterThan32:
-        bound = cmp->Arg(1) == element ? cmp->Arg(0) : IR::Value{};
-        break;
-    default:
-        break;
-    }
-    const IR::Inst* source = bound.TryInst();
-    if (!source || (source->GetOpcode() != IR::Opcode::ReadConst &&
-                    source->GetOpcode() != IR::Opcode::GetUserData)) {
-        return UNKNOWN_LOCATION;
-    }
-    return FlatLocation(bound).value_or(UNKNOWN_LOCATION);
-}
 
 /// Per-game dynamic_tsharp_array_size: recognizes a sharp whose dwords are all ReadConst(ptr, element *
 /// stride + first + k), ptr being flattened (SotC cs 0xfb974c0e reads the reflection probe cubemap at P +
@@ -402,7 +328,7 @@ std::optional<SharpTableMatch> MatchSharpTable(const SharpReference& sharp) {
         }
         if (!match) {
             match = SharpTableMatch{*ptr_lo, *ptr_hi, offset.element, offset.scale,
-                                    offset.offset - i, FindLoopCountLocation(offset.element)};
+                                    offset.offset - i};
         } else if (*ptr_lo != match->ptr_lo || *ptr_hi != match->ptr_hi ||
                    offset.element != match->element || offset.scale != match->stride_dw ||
                    offset.offset != match->first_dw + i) {
@@ -419,7 +345,6 @@ std::optional<SharpFetch<AmdGpu::Image>> AddSharpTable(Info& info, const SharpTa
     auto it = std::ranges::find_if(info.sharp_tables, [&](const SharpTable& table) {
         return table.ptr_lo == match.ptr_lo && table.ptr_hi == match.ptr_hi &&
                table.stride_dw == match.stride_dw && table.num_elements == num_elements &&
-               table.count_loc == match.count_loc &&
                match.first_dw >= table.offset_dw &&
                match.first_dw + num_dwords <= table.offset_dw + table.stride_dw;
     });
@@ -436,7 +361,6 @@ std::optional<SharpFetch<AmdGpu::Image>> AddSharpTable(Info& info, const SharpTa
             .num_elements = static_cast<u16>(num_elements),
             .offset_dw = match.first_dw,
             .stride_dw = match.stride_dw,
-            .count_loc = match.count_loc,
         });
         info.srt_info.flattened_bufsize_dw += num_elements * match.stride_dw;
         // Make the elements visible to the rest of the compilation (image type, cube fixup)
@@ -451,12 +375,9 @@ std::optional<SharpFetch<AmdGpu::Image>> AddSharpTable(Info& info, const SharpTa
     }
     LOG_WARNING(Render_Recompiler,
                 "Workaround dynamic_tsharp_array_size: shader {:#x} indexes {} T#s at "
-                "flat[{}:{}] + {:#x}, stride {} bytes, {}",
+                "flat[{}:{}] + {:#x}, stride {} bytes",
                 info.pgm_hash, num_elements, match.ptr_lo, match.ptr_hi, match.first_dw * 4,
-                match.stride_dw * 4,
-                match.count_loc != UNKNOWN_LOCATION
-                    ? fmt::format("loop count at flat[{}]", match.count_loc)
-                    : std::string{"no loop count"});
+                match.stride_dw * 4);
     return fetch;
 }
 
@@ -483,7 +404,7 @@ void PatchBufferSharp(const ResourceDiscovery& resource, Info& info, Descriptors
     IR::Inst& inst = *resource.user;
 
     const u32 buffer_binding = descriptors.Add(BufferResource{
-        .sharp_fetch = ConstructSharpFetch<AmdGpu::Buffer>(info, resource.sharps[0]),
+        .sharp_fetch = ConstructSharpFetch<AmdGpu::Buffer>(resource.sharps[0]),
         .used_types = BufferDataType(inst, profile),
         .buffer_type = BufferType::Guest,
         .is_written = IsBufferStore(inst),
@@ -510,20 +431,11 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     // need fallback (TODO is this 100% true?)
     const bool needs_mip_storage_fallback =
         inst_info.has_lod && is_written && !profile.supports_image_load_store_lod;
-    // Use descriptor arrays for SotC's probe cubemaps in cs 0xfb974c0e and projector shadows in vs 0x9d6f9bf4; graphics stages also need a
-    // known loop bound
-    const u32 array_size = DynamicTsharpArraySize();
+    // Per-game: a sampled T# read at a dynamic offset becomes a descriptor array. Compute only: SotC's vs
+    // 0x9d6f9bf4 matches too (shadow map tables) and hung the GPU with it
+    const u32 array_size = info.hw_stage == HwStage::Compute ? DynamicTsharpArraySize() : 0;
     auto table =
         array_size != 0 && !is_written ? MatchSharpTable(resource.sharps[0]) : std::nullopt;
-    if (table && info.hw_stage != HwStage::Compute && table->count_loc == UNKNOWN_LOCATION) {
-        // Keep a null image without a loop bound; binding unrelated data past the live entries caused a GPU hang in vs 0x9d6f9bf4
-        LOG_WARNING(
-            Render_Recompiler,
-            "Workaround dynamic_tsharp_array_size: shader {:#x} indexes a T# table without a "
-            "loop count, left null",
-            info.pgm_hash);
-        table.reset();
-    }
     if (table && NumArrayDescriptors(info) + array_size + 1 > NUM_IMAGE_ARRAY_DESCRIPTORS) {
         // The binder has room for NUM_IMAGE_ARRAY_DESCRIPTORS; this sharp keeps the default path
         LOG_WARNING(Render_Recompiler,
@@ -537,7 +449,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
               : std::nullopt;
     ImageResource image_res = {
         .sharp_fetch = table_fetch ? *table_fetch
-                                   : ConstructSharpFetch<AmdGpu::Image>(info, resource.sharps[0]),
+                                   : ConstructSharpFetch<AmdGpu::Image>(resource.sharps[0]),
         .is_depth = bool(inst_info.is_depth),
         .is_atomic = is_atomic,
         .is_array = bool(inst_info.is_array),
@@ -622,19 +534,12 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     u32 bindings = image_binding;
     if (inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
-        const IR::Inst* lod_prod = resource.sharps[1].post_op_data.lod_prod.TryInst();
-        const SharpLocation tsharp_dw3_off =
-            lod_prod ? SharpLocationFromSource(lod_prod) : UNKNOWN_LOCATION;
-        auto post_op = resource.sharps[1].post_op;
-        if (post_op == SharpFetchPostOp::DisableAnisoIfSingleLod &&
-            tsharp_dw3_off == UNKNOWN_LOCATION) {
-            // T# dword 3 has no flat location here; GetSharp would otherwise read flattened_ud_buf[UNKNOWN_LOCATION]
-            post_op = SharpFetchPostOp::None;
-        }
+        auto& lod_prod = resource.sharps[1].post_op_data.lod_prod;
         const u32 sampler_binding = descriptors.Add(SamplerResource{
-            .sharp_fetch = ConstructSharpFetch<AmdGpu::Sampler>(info, resource.sharps[1]),
-            .post_op = post_op,
-            .post_op_tsharp_dw3_off = tsharp_dw3_off,
+            .sharp_fetch = ConstructSharpFetch<AmdGpu::Sampler>(resource.sharps[1]),
+            .post_op = resource.sharps[1].post_op,
+            .post_op_tsharp_dw3_off =
+                lod_prod.IsEmpty() ? UNKNOWN_LOCATION : SharpLocationFromSource(lod_prod.Inst()),
             .is_depth = bool(inst_info.is_depth), // true for the _C (compare) opcodes
         });
         bindings |= sampler_binding << 16;

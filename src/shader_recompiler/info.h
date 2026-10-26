@@ -156,8 +156,6 @@ struct Info : InfoPersistent {
     bool stores_tess_level_outer{};
     bool stores_tess_level_inner{};
     bool translation_failed{};
-    /// Log an out-of-range table count only once per shader
-    bool sharp_table_count_logged{};
 
     std::array<Interpolation, IR::NumParams> fs_interpolation{};
 
